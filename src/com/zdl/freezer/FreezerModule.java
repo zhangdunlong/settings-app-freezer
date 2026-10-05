@@ -22,11 +22,14 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.ViewTreeObserver;
 import android.view.inputmethod.InputMethodManager;
+import android.widget.LinearLayout;
+import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.FrameLayout;
 import android.widget.Toast;
 import android.util.TypedValue;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
@@ -75,6 +78,8 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
     private static final String TAG = "FreezerModule";
     private static final String MODULE_PKG = "com.zdl.freezer";
     private static final int FROZEN_TAG = 0x5f465252; // "FRZR"
+    private static final int FROZEN_BAR_TAG = 0x5f465242;  // "FRRB" - the horizontal bar
+    private static final int FROZEN_LIST_TAG = 0x5f464c53; // "FRLS" - frozen-list entry button
 
     private static final String ACTION_APP_DETAILS = "android.settings.APPLICATION_DETAILS_SETTINGS";
 
@@ -85,6 +90,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
     private static final int ACCENT_PRESSED = 0xFF15849B;
     private static final int ACCENT_FROZEN = 0xFF3FBFA8;          // mint = currently frozen
     private static final int ACCENT_FROZEN_PRESSED = 0xFF33998A;
+    private static final int LIST_BADGE = 0xFF3A6EA5;       // entry button for the frozen list
 
     // CRITICAL: do NOT create a static Handler here. The class is initialised during
     // Zygote.specializeAppProcess(), before the main Looper exists, so
@@ -990,10 +996,17 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             int state = safeEnabledState(pm, pkg);
             final boolean frozen = isFrozen(state);
 
-            // Use a plain TextView rather than Button: OEM themes (ColorOS/OPlus) restyle
+            // Horizontal bar: [ freeze/unfreeze ] [ frozen-apps list ]
+            // A LinearLayout is used instead of two sibling views so the pair is always centred
+            // together and never overlaps OEM bottom controls.
+            LinearLayout bar = new LinearLayout(activity);
+            bar.setOrientation(LinearLayout.HORIZONTAL);
+            bar.setGravity(Gravity.CENTER_VERTICAL);
+            bar.setTag(FROZEN_BAR_TAG);
+
+            // Use plain TextViews rather than Buttons: OEM themes (ColorOS/OPlus) restyle
             // Button backgrounds and paddings so aggressively that the label ends up invisible
-            // (you see a coloured blob with no text). A TextView with a self-drawn background
-            // is fully theme-independent.
+            // (you see a coloured blob with no text). Self-drawn backgrounds are theme-independent.
             TextView btn = new TextView(activity);
             btn.setTag(FROZEN_TAG);
             btn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f);
@@ -1009,13 +1022,29 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             applyPill(btn, frozen);
             updateLabel(btn, state, pkg);
 
+            LinearLayout.LayoutParams btnLp = new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT);
+            bar.addView(btn, btnLp);
+
+            // Entry point to the frozen-apps list. Shows a live count badge so the user can
+            // tell at a glance whether anything is frozen at all.
+            final TextView listBtn = buildListButton(activity);
+            LinearLayout.LayoutParams listLp = new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT);
+            listLp.leftMargin = dp(activity, 10);
+            listBtn.setLayoutParams(listLp);
+            bar.addView(listBtn, listLp);
+            refreshListBadge(listBtn);
+
             FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
                     FrameLayout.LayoutParams.WRAP_CONTENT,
                     FrameLayout.LayoutParams.WRAP_CONTENT);
             lp.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
             lp.bottomMargin = dp(activity, 150); // clear of the gesture nav bar
-            btn.setLayoutParams(lp);
-            btn.setContentDescription("冻结应用按钮");
+            bar.setLayoutParams(lp);
+            bar.setContentDescription("冻结操作栏");
 
             final String target = pkg;
             btn.setOnClickListener(new View.OnClickListener() {
@@ -1031,21 +1060,27 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
                     return true;
                 }
             });
+            listBtn.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    showFrozenList(activity);
+                }
+            });
 
-            parent.addView(btn);
-            btn.post(new Runnable() {
+            parent.addView(bar);
+            bar.post(new Runnable() {
                 @Override
                 public void run() {
                     // Log the real measured size so a "coloured blob with no text" report can be
                     // distinguished from a text-rendering issue.
-                    android.util.Log.i(TAG, "button measured "
-                            + btn.getWidth() + "x" + btn.getHeight()
-                            + " text='" + btn.getText() + "'"
-                            + " textSize=" + btn.getTextSize()
-                            + " textColor=" + btn.getCurrentTextColor());
+                    android.util.Log.i(TAG, "bar measured " + bar.getWidth() + "x" + bar.getHeight()
+                            + " btn='" + btn.getText() + "'"
+                            + " btnSize=" + btn.getWidth() + "x" + btn.getHeight()
+                            + " listBtn='" + listBtn.getText() + "'"
+                            + " listSize=" + listBtn.getWidth() + "x" + listBtn.getHeight());
                 }
             });
-            XposedBridge.log(TAG + ": button injected for " + pkg
+            XposedBridge.log(TAG + ": button bar injected for " + pkg
                     + " (state=" + stateToName(state) + ") into " + parent.getClass().getName());
             return true;
         } catch (Throwable t) {
@@ -1053,6 +1088,211 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             return false;
         }
     }
+
+    /** Builds the "frozen apps" entry button; the label is filled by {@link #refreshListBadge}. */
+    private static TextView buildListButton(Activity activity) {
+        TextView t = new TextView(activity);
+        t.setTag(FROZEN_LIST_TAG);
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f);
+        t.setTypeface(Typeface.DEFAULT_BOLD);
+        t.setTextColor(Color.WHITE);
+        t.setGravity(Gravity.CENTER);
+        t.setSingleLine(true);
+        t.setIncludeFontPadding(false);
+        t.setPadding(dp(activity, 18), dp(activity, 12), dp(activity, 18), dp(activity, 12));
+        t.setElevation(dp(activity, 10));
+        t.setBackground(solidWith(LIST_BADGE));
+        t.setContentDescription("查看已冻结应用列表");
+        return t;
+    }
+
+    /** Updates the list button label with the current frozen-app count. */
+    private static void refreshListBadge(TextView listBtn) {
+        try {
+            int n = queryFrozenPackages(listBtn.getContext()).size();
+            listBtn.setText(n > 0 ? ("❄ 已冻结 " + n) : "❄ 已冻结 0");
+            listBtn.setAlpha(n > 0 ? 1f : 0.6f);
+        } catch (Throwable t) {
+            listBtn.setText("❄ 已冻结");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Frozen-apps list
+    // ------------------------------------------------------------------
+
+    /**
+     * @return packages whose enabled state is exactly {@code DISABLED_USER}, i.e. frozen by the
+     * user (or by this module) — deliberately excluding factory/system-disabled packages so the
+     * list stays short and meaningful.
+     */
+    private static List<String> queryFrozenPackages(Context ctx) {
+        List<String> out = new ArrayList<>();
+        if (ctx == null) return out;
+        PackageManager pm = ctx.getPackageManager();
+        try {
+            List<ApplicationInfo> apps =
+                    pm.getInstalledApplications(PackageManager.MATCH_DISABLED_COMPONENTS);
+            if (apps == null) return out;
+            for (ApplicationInfo ai : apps) {
+                if (ai == null || ai.packageName == null) continue;
+                if (ai.packageName.equals(MODULE_PKG)) continue;
+                try {
+                    if (pm.getApplicationEnabledSetting(ai.packageName)
+                            == PackageManager.COMPONENT_ENABLED_STATE_DISABLED_USER) {
+                        out.add(ai.packageName);
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+        } catch (Throwable t) {
+            logOnce("queryFrozenPackages failed: " + t);
+        }
+        java.util.Collections.sort(out);
+        return out;
+    }
+
+    /**
+     * Shows a dialog listing every frozen app. Tapping a row unfreezes it immediately and
+     * refreshes the list in place.
+     */
+    private void showFrozenList(final Activity activity) {
+        try {
+            final PackageManager pm = activity.getPackageManager();
+            final List<String> frozen = queryFrozenPackages(activity);
+            if (frozen.isEmpty()) {
+                toast(activity, "当前没有已冻结的应用", Toast.LENGTH_SHORT);
+                return;
+            }
+
+            final LinearLayout list = new LinearLayout(activity);
+            list.setOrientation(LinearLayout.VERTICAL);
+            int pad = dp(activity, 8);
+            list.setPadding(pad, pad, pad, pad);
+
+            final TextView header = new TextView(activity);
+            header.setText("已冻结应用（" + frozen.size() + "）· 点击即可解冻");
+            header.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f);
+            header.setTypeface(Typeface.DEFAULT_BOLD);
+            header.setTextColor(0xFF666666);
+            header.setPadding(dp(activity, 12), dp(activity, 6), dp(activity, 12), dp(activity, 10));
+            list.addView(header);
+
+            for (final String pkg : frozen) {
+                list.addView(buildFrozenRow(activity, pm, pkg, list));
+            }
+
+            ScrollView scroll = new ScrollView(activity);
+            scroll.addView(list);
+
+            final android.app.AlertDialog dialog = new android.app.AlertDialog.Builder(activity)
+                    .setView(scroll)
+                    .setPositiveButton("关闭", null)
+                    .create();
+            dialog.show();
+
+            XposedBridge.log(TAG + ": frozen list shown, " + frozen.size() + " entries");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": showFrozenList failed: " + t);
+            toast(activity, "打开列表失败：" + t.getMessage(), Toast.LENGTH_LONG);
+        }
+    }
+
+    /** One row in the frozen list: icon + label + package, tappable to unfreeze. */
+    private View buildFrozenRow(final Activity activity, final PackageManager pm,
+                                       final String pkg, final LinearLayout parentList) {
+        LinearLayout row = new LinearLayout(activity);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(activity, 12), dp(activity, 10), dp(activity, 12), dp(activity, 10));
+        row.setBackground(rippleBg(0xFFF2F5F7));
+
+        android.widget.ImageView icon = new android.widget.ImageView(activity);
+        LinearLayout.LayoutParams iconLp = new LinearLayout.LayoutParams(dp(activity, 40),
+                dp(activity, 40));
+        iconLp.rightMargin = dp(activity, 12);
+        row.addView(icon, iconLp);
+        try {
+            icon.setImageDrawable(pm.getApplicationIcon(pkg));
+        } catch (Throwable t) {
+            icon.setBackground(solidWith(0xFFDDDDDD));
+        }
+
+        LinearLayout col = new LinearLayout(activity);
+        col.setOrientation(LinearLayout.VERTICAL);
+        row.addView(col, new LinearLayout.LayoutParams(0,
+                LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+        TextView name = new TextView(activity);
+        name.setText(safeAppLabel(activity, pm, pkg));
+        name.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f);
+        name.setTypeface(Typeface.DEFAULT_BOLD);
+        name.setTextColor(0xFF222222);
+        col.addView(name);
+
+        TextView sub = new TextView(activity);
+        sub.setText(pkg);
+        sub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f);
+        sub.setTextColor(0xFF888888);
+        col.addView(sub);
+
+        row.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                unfreezeFromList(activity, pm, pkg, parentList);
+            }
+        });
+        return row;
+    }
+
+    private void unfreezeFromList(final Activity activity, final PackageManager pm,
+                                         final String pkg, final LinearLayout parentList) {
+        try {
+            pm.setApplicationEnabledSetting(pkg,
+                    PackageManager.COMPONENT_ENABLED_STATE_ENABLED, 0);
+            int now = safeEnabledState(pm, pkg);
+            if (isFrozen(now)) {
+                toast(activity, "解冻失败（可能被系统拦截）", Toast.LENGTH_LONG);
+                return;
+            }
+            toast(activity, "已解冻 " + safeAppLabel(activity, pm, pkg), Toast.LENGTH_SHORT);
+            XposedBridge.log(TAG + ": unfrozen from list: " + pkg);
+            // Remove the row and refresh the header count.
+            try {
+                parentList.removeView((View) parentList.getParent());
+            } catch (Throwable ignored) {
+            }
+            // Simplest robust refresh: rebuild the whole list.
+            showFrozenList(activity);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": unfreezeFromList failed for " + pkg + ": " + t);
+            toast(activity, "解冻失败：" + t.getMessage(), Toast.LENGTH_LONG);
+        }
+    }
+
+    private static String safeAppLabel(Context ctx, PackageManager pm, String pkg) {
+        try {
+            ApplicationInfo ai = pm.getApplicationInfo(pkg, 0);
+            CharSequence l = pm.getApplicationLabel(ai);
+            if (l != null && l.length() > 0) return l.toString();
+        } catch (Throwable ignored) {
+        }
+        return pkg;
+    }
+
+    /** A light rounded background that darkens on press, for list rows. */
+    private static android.graphics.drawable.Drawable rippleBg(final int color) {
+        try {
+            android.graphics.drawable.StateListDrawable sl =
+                    new android.graphics.drawable.StateListDrawable();
+            sl.addState(new int[]{android.R.attr.state_pressed}, solidWith(0xFFE0E4E7));
+            sl.addState(new int[]{}, solidWith(color));
+            return sl;
+        } catch (Throwable t) {
+            return solidWith(color);
+        }
+    }
+
 
     // ------------------------------------------------------------------
     // Action
@@ -1083,6 +1323,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
                     : isFrozen(newState);
 
             updateLabel(btn, newState, pkg);
+            refreshSiblingListBadge(btn);
             String msg = ok
                     ? ((next == PackageManager.COMPONENT_ENABLED_STATE_ENABLED)
                         ? "已解冻 " + pkg : "已冻结 " + pkg)
@@ -1259,6 +1500,17 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
         return state == PackageManager.COMPONENT_ENABLED_STATE_DISABLED_USER
                 || state == PackageManager.COMPONENT_ENABLED_STATE_DISABLED
                 || state == PackageManager.COMPONENT_ENABLED_STATE_DISABLED_UNTIL_USED;
+    }
+
+    /** Refresh the frozen-list counter sitting next to the freeze button, if present. */
+    private static void refreshSiblingListBadge(TextView btn) {
+        try {
+            View bar = (View) btn.getParent();
+            if (bar == null) return;
+            View badge = bar.findViewWithTag(FROZEN_LIST_TAG);
+            if (badge instanceof TextView) refreshListBadge((TextView) badge);
+        } catch (Throwable ignored) {
+        }
     }
 
     private static String stateToName(int state) {
