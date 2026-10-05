@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.zdl.freezer"
+    android:versionCode="100"
+    android:versionName="1.0.0">
+    <application
+        android:allowBackup="true"
+        android:label="设置内冻结 Freezer"
+        android:hasCode="true">
+        <meta-data
+            android:name="xposedmodule"
+            android:value="true" />
+        <meta-data
+            android:name="xposedminversion"
+            android:value="82" />
+        <meta-data
+            android:name="xposeddescription"
+            android:value="在系统设置的应用信息页注入「冻结/解冻」按钮，停用任意用户应用以达到冻结效果。针对 ColorOS / RealmeUI / 现代 Android 重写，无需依赖厂商内部类。" />
+        <meta-data
+            android:name="xposedscope"
+            android:value="com.android.settings:com.coloros.settings:com.oppo.settings:com.oplus.settings:com.realme.settings:com.oneplus.settings" />
+    </application>
+</manifest>

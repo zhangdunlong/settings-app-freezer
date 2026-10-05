@@ -1,0 +1,57 @@
+# ---- Build outputs ----
+out/
+build/
+*.apk
+*.aab
+*.ap_
+*.idsig
+*.dex
+*.jar
+!lib/*.jar
+*.class
+*.log
+
+# ---- Signing material (NEVER commit) ----
+*.keystore
+*.jks
+debug.keystore
+release.keystore
+keystore.properties
+
+# ---- Local environment / SDK ----
+local.properties
+local.defaults.properties
+sdk/
+android-sdk/
+tools/
+.jdk/
+
+# ---- Toolchain path shims (machine specific) ----
+# api-82.jar is fetched manually; see README "获取依赖" section.
+# If you commit a copy, remove this line:
+lib/api-*.jar
+
+# ---- IDE ----
+.idea/
+*.iml
+.vscode/
+.settings/
+.project
+.classpath
+.gen/
+
+# ---- OS cruft ----
+.DS_Store
+Thumbs.db
+desktop.ini
+*~
+*.swp
+*.tmp
+*.bak
+*.orig
+*.rej
+
+# ---- Misc ----
+__pycache__/
+*.pyc
+node_modules/
