@@ -1,0 +1,13 @@
+# Normalize line endings: repository stores LF, working tree gets native endings.
+* text=auto eol=lf
+
+# Windows-only helper must keep LF (it is executed by a POSIX-ish shell / python)
+*.sh text eol=lf
+*.py text eol=lf
+
+# Binary-ish assets
+*.apk binary
+*.jar binary
+*.dex binary
+*.keystore binary
+*.jks binary

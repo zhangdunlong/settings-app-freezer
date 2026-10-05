@@ -22,9 +22,10 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.ViewTreeObserver;
 import android.view.inputmethod.InputMethodManager;
-import android.widget.Button;
+import android.widget.TextView;
 import android.widget.FrameLayout;
 import android.widget.Toast;
+import android.util.TypedValue;
 
 import java.util.Arrays;
 import java.util.HashSet;
@@ -332,15 +333,17 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             lastResolvedPkg = null;
             return null;
         }
-        // Only reuse it while we are actually on an app-info screen of the same app.
+        // Only reuse it while we are still on an app-info screen. Note that the surviving
+        // parent activity on ColorOS may be a generic "SubSettings" shell, so the class-name
+        // test is intentionally permissive: what matters is that the window is still the one
+        // the user navigated to, which we approximate by requiring an app-info-ish title or a
+        // still-fresh timestamp.
         try {
-            String cls = activity.getClass().getName();
-            if (!cls.contains("AppInfo") && !cls.contains("InstalledApp")
-                    && !cls.contains("AppDetails") && !cls.contains("applications.")) {
+            PackageManager pm = activity.getPackageManager();
+            if (pm.getApplicationInfo(pkg, 0) == null) {
+                lastResolvedPkg = null;
                 return null;
             }
-            PackageManager pm = activity.getPackageManager();
-            if (pm.getApplicationInfo(pkg, 0) == null) return null;
         } catch (Throwable t) {
             return null;
         }
@@ -370,24 +373,106 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             for (Class<?> c = activity.getClass(); c != null && c != Activity.class;
                  c = c.getSuperclass()) {
                 for (java.lang.reflect.Field f : c.getDeclaredFields()) {
-                    String name = f.getName().toLowerCase();
-                    if (!(name.contains("package") || name.contains("packagename")
-                            || name.equals("pkgname"))) {
-                        continue;
+                    if (java.lang.reflect.Modifier.isStatic(f.getModifiers())) continue;
+                    try {
+                        f.setAccessible(true);
+                        Object v = f.get(activity);
+                        if (v == null) continue;
+
+                        // (a) direct String field, whatever its name — verified against the PM
+                        if (v instanceof String) {
+                            String s = (String) v;
+                            if (looksLikePackage(s) && pm.getApplicationInfo(s, 0) != null) {
+                                XposedBridge.log(TAG + ": recovered package '" + s
+                                        + "' from field " + c.getSimpleName() + "." + f.getName());
+                                return s;
+                            }
+                            continue;
+                        }
+
+                        // (b) Fragment field (ColorOS hosts the app-info screen as a fragment)
+                        if (v instanceof android.app.Fragment) {
+                            String got = scanFragmentForPkg((android.app.Fragment) v, pm);
+                            if (got != null) {
+                                XposedBridge.log(TAG + ": recovered package '" + got
+                                        + "' from fragment in field "
+                                        + c.getSimpleName() + "." + f.getName());
+                                return got;
+                            }
+                            continue;
+                        }
+
+                        // (c) View field — walk the subtree for a package hint
+                        if (v instanceof View) {
+                            String got = describeViewForPackage((View) v, pm);
+                            if (got != null) {
+                                String p = got.replaceAll("^.*(->|=) ", "");
+                                XposedBridge.log(TAG + ": recovered package '" + p
+                                        + "' from view subtree in field "
+                                        + c.getSimpleName() + "." + f.getName());
+                                if (looksLikePackage(p)) return p;
+                            }
+                        }
+                    } catch (Throwable ignored) {
                     }
-                    f.setAccessible(true);
-                    Object v = f.get(activity);
-                    if (!(v instanceof String)) continue;
-                    String s = (String) v;
-                    if (!looksLikePackage(s)) continue;
-                    if (pm.getApplicationInfo(s, 0) == null) continue;
-                    XposedBridge.log(TAG + ": recovered package '" + s
-                            + "' from field " + c.getSimpleName() + "." + f.getName());
-                    return s;
                 }
+            }
+            // Last resort: the activity's own content view.
+            try {
+                View content = activity.findViewById(android.R.id.content);
+                if (content != null) {
+                    String got = describeViewForPackage(content, pm);
+                    if (got != null) {
+                        String p = got.replaceAll("^.*(->|=) ", "");
+                        if (looksLikePackage(p)) {
+                            XposedBridge.log(TAG + ": recovered package '" + p
+                                    + "' from content view subtree");
+                            return p;
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {
             }
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": extractPkgFromFields error: " + t);
+        }
+        return null;
+    }
+
+    /** Recursively search a fragment (and its child fragment manager) for the package name. */
+    private static String scanFragmentForPkg(android.app.Fragment fr, PackageManager pm) {
+        try {
+            if (fr.getArguments() != null) {
+                for (String k : fr.getArguments().keySet()) {
+                    Object v = fr.getArguments().get(k);
+                    if (v instanceof String && looksLikePackage((String) v)
+                            && pm.getApplicationInfo((String) v, 0) != null) {
+                        return (String) v;
+                    }
+                }
+            }
+            if (fr.getView() != null) {
+                String got = describeViewForPackage(fr.getView(), pm);
+                if (got != null) {
+                    String p = got.replaceAll("^.*(->|=) ", "");
+                    if (looksLikePackage(p)) return p;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            if (fr instanceof android.app.ListFragment) {
+                android.app.ListFragment lf = (android.app.ListFragment) fr;
+                Object adapter = lf.getListAdapter();
+                if (adapter != null) {
+                    // App list adapters often expose the selected package through the clicked view.
+                    String m = adapter.getClass().getName();
+                    if (m != null && (m.contains("App") || m.contains("Package"))) {
+                        logOnce("app-list adapter class = " + m);
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
         }
         return null;
     }
@@ -417,6 +502,120 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
     }
 
     /**
+     * One-shot diagnostic: dump everything that might carry the target package name when we
+     * land on a laid-out window but cannot resolve a package. This is how the OEM-specific
+     * passing mechanism gets identified from a user-supplied log.
+     */
+    private static void dumpUnknownActivity(Activity act, View decor) {
+        String key = act.getClass().getName() + "@" + System.identityHashCode(act);
+        if (!DUMPED.add(key)) return;
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("\n--- DUMP for unresolved app-info window ---\n");
+        sb.append("activity : ").append(act.getClass().getName()).append('\n');
+        try {
+            sb.append("intent   : ").append(act.getIntent()).append('\n');
+            android.os.Bundle b = act.getIntent() != null ? act.getIntent().getExtras() : null;
+            if (b != null) {
+                for (String k : b.keySet()) {
+                    Object v = b.get(k);
+                    sb.append("  extra[").append(k).append("] = ")
+                      .append(v == null ? "null" : v.getClass().getName() + " -> " + v).append('\n');
+                }
+            } else {
+                sb.append("  (no extras)\n");
+            }
+        } catch (Throwable t) {
+            sb.append("  intent read error: ").append(t).append('\n');
+        }
+
+        // Scan the Activity and its Fragment fields for the package.
+        PackageManager pm = act.getPackageManager();
+        for (Class<?> c = act.getClass(); c != null && c != Activity.class; c = c.getSuperclass()) {
+            for (java.lang.reflect.Field f : c.getDeclaredFields()) {
+                if (java.lang.reflect.Modifier.isStatic(f.getModifiers())) continue;
+                try {
+                    f.setAccessible(true);
+                    Object v = f.get(act);
+                    if (v == null) continue;
+                    String s;
+                    if (v instanceof String) {
+                        s = (String) v;
+                        if (!looksLikePackage(s)) continue;
+                    } else if (v instanceof android.app.Fragment) {
+                        android.app.Fragment fr = (android.app.Fragment) v;
+                        s = describeFragment(fr, pm);
+                        if (s == null) continue;
+                    } else if (v instanceof android.view.View) {
+                        s = describeViewForPackage((View) v, pm);
+                        if (s == null) continue;
+                    } else {
+                        continue;
+                    }
+                    sb.append("  field ").append(c.getSimpleName()).append('.')
+                      .append(f.getName()).append(" -> ").append(s).append('\n');
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+        sb.append("--- END DUMP ---");
+        XposedBridge.log(TAG + sb.toString());
+    }
+
+    private static final java.util.Set<String> DUMPED =
+            java.util.Collections.synchronizedSet(new java.util.HashSet<String>());
+
+    private static String describeFragment(android.app.Fragment fr, PackageManager pm) {
+        try {
+            String cls = fr.getClass().getName();
+            if (!cls.contains("AppInfo") && !cls.contains("InstalledApp")
+                    && !cls.contains("AppDetails") && !cls.contains("Applications")) {
+                return null;
+            }
+            if (fr.getArguments() != null) {
+                for (String k : fr.getArguments().keySet()) {
+                    Object v = fr.getArguments().get(k);
+                    if (v instanceof String && looksLikePackage((String) v)
+                            && pm.getApplicationInfo((String) v, 0) != null) {
+                        return "FRAGMENT " + cls + " arg[" + k + "]=" + v;
+                    }
+                }
+            }
+            return "FRAGMENT " + cls + " (matched class, no pkg arg)";
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** Walk the view subtree looking for a child that references a real package (e.g. a
+     *  package-icon ImageView whose content description or tag holds the package). */
+    private static String describeViewForPackage(View v, PackageManager pm) {
+        try {
+            Object tag = v.getTag();
+            if (tag instanceof String && looksLikePackage((String) tag)
+                    && pm.getApplicationInfo((String) tag, 0) != null) {
+                return "VIEW tag=" + tag;
+            }
+            if (v instanceof android.widget.TextView) {
+                CharSequence t2 = ((android.widget.TextView) v).getText();
+                if (t2 != null && looksLikePackage(t2.toString())
+                        && pm.getApplicationInfo(t2.toString(), 0) != null) {
+                    return "VIEW text=" + t2;
+                }
+            }
+            if (v instanceof android.view.ViewGroup) {
+                android.view.ViewGroup g = (android.view.ViewGroup) v;
+                for (int i = 0; i < g.getChildCount(); i++) {
+                    String r = describeViewForPackage(g.getChildAt(i), pm);
+                    if (r != null) return r;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    /**
      * Last-resort injector: hook the framework's "view tree finished its first real layout"
      * callback. At that instant the decor view is guaranteed to have a non-zero size, which is
      * exactly the signal we could not get from the app-info Activity lifecycle on ColorOS.
@@ -443,9 +642,19 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
                                 if (decor.findViewWithTag(FROZEN_TAG) != null) return;
 
                                 Activity act = activityForDecor(decor);
-                                if (act == null) return;
+                                if (act == null) {
+                                    logOnce("layout: no Activity for decor "
+                                            + decor.getClass().getName()
+                                            + " ctx=" + decor.getContext().getClass().getName());
+                                    return;
+                                }
                                 final String pkg = resolvePkgForLifecycle(act);
-                                if (pkg == null) return;
+                                if (pkg == null) {
+                                    // Dump the full context once per Activity so the OEM-specific
+                                    // package-passing mechanism can be identified from logs.
+                                    dumpUnknownActivity(act, decor);
+                                    return;
+                                }
                                 XposedBridge.log(TAG + ": layout done for " + pkg
                                         + " activity=" + act.getClass().getName()
                                         + " decor=" + decor.getWidth() + "x" + decor.getHeight());
@@ -779,31 +988,40 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             }
             final PackageManager pm = activity.getPackageManager();
             int state = safeEnabledState(pm, pkg);
+            final boolean frozen = isFrozen(state);
 
-            Button btn = new Button(activity);
+            // Use a plain TextView rather than Button: OEM themes (ColorOS/OPlus) restyle
+            // Button backgrounds and paddings so aggressively that the label ends up invisible
+            // (you see a coloured blob with no text). A TextView with a self-drawn background
+            // is fully theme-independent.
+            TextView btn = new TextView(activity);
             btn.setTag(FROZEN_TAG);
-            btn.setAllCaps(false);
-            btn.setTextSize(15f);
+            btn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f);
             btn.setTypeface(Typeface.DEFAULT_BOLD);
             btn.setTextColor(Color.WHITE);
-            btn.setPadding(dp(activity, 28), dp(activity, 14), dp(activity, 28), dp(activity, 14));
-            btn.setElevation(dp(activity, 8));
-            btn.setTranslationZ(dp(activity, 8));
-            applyPill(btn, isFrozen(state));
+            btn.setGravity(Gravity.CENTER);
+            btn.setSingleLine(false);
+            btn.setMaxLines(2);
+            btn.setIncludeFontPadding(false);
+            btn.setPadding(dp(activity, 22), dp(activity, 12),
+                    dp(activity, 22), dp(activity, 12));
+            btn.setElevation(dp(activity, 10));
+            applyPill(btn, frozen);
+            updateLabel(btn, state, pkg);
 
             FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
                     FrameLayout.LayoutParams.WRAP_CONTENT,
                     FrameLayout.LayoutParams.WRAP_CONTENT);
-            lp.gravity = Gravity.BOTTOM | Gravity.END;
-            lp.bottomMargin = dp(activity, 132); // clear of the gesture nav bar
-            lp.rightMargin = dp(activity, 24);
+            lp.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
+            lp.bottomMargin = dp(activity, 150); // clear of the gesture nav bar
             btn.setLayoutParams(lp);
+            btn.setContentDescription("冻结应用按钮");
 
             final String target = pkg;
             btn.setOnClickListener(new View.OnClickListener() {
                 @Override
                 public void onClick(View v) {
-                    toggle(activity, (Button) v, target);
+                    toggle(activity, (TextView) v, target);
                 }
             });
             btn.setOnLongClickListener(new View.OnLongClickListener() {
@@ -815,6 +1033,18 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             });
 
             parent.addView(btn);
+            btn.post(new Runnable() {
+                @Override
+                public void run() {
+                    // Log the real measured size so a "coloured blob with no text" report can be
+                    // distinguished from a text-rendering issue.
+                    android.util.Log.i(TAG, "button measured "
+                            + btn.getWidth() + "x" + btn.getHeight()
+                            + " text='" + btn.getText() + "'"
+                            + " textSize=" + btn.getTextSize()
+                            + " textColor=" + btn.getCurrentTextColor());
+                }
+            });
             XposedBridge.log(TAG + ": button injected for " + pkg
                     + " (state=" + stateToName(state) + ") into " + parent.getClass().getName());
             return true;
@@ -828,7 +1058,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
     // Action
     // ------------------------------------------------------------------
 
-    private void toggle(Activity activity, Button btn, String pkg) {
+    private void toggle(Activity activity, TextView btn, String pkg) {
         try {
             PackageManager pm = activity.getPackageManager();
 
@@ -981,7 +1211,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
     // UI helpers
     // ------------------------------------------------------------------
 
-    private void updateLabel(Button btn, int state, String pkg) {
+    private void updateLabel(TextView btn, int state, String pkg) {
         boolean frozen = isFrozen(state);
         String block = null;
         try {
@@ -997,14 +1227,13 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
      * Rounded pill background that darkens while pressed. Frozen pills get a lighter tint so
      * the state is readable at a glance without relying on the label alone.
      */
-    private static void applyPill(Button btn, boolean frozen) {
+    private static void applyPill(TextView btn, boolean frozen) {
         int idle = frozen ? ACCENT_FROZEN : ACCENT;
         int pressed = frozen ? ACCENT_FROZEN_PRESSED : ACCENT_PRESSED;
         StateListDrawable bg = new StateListDrawable();
         bg.addState(new int[]{android.R.attr.state_pressed}, solidWith(pressed));
         bg.addState(new int[]{}, solidWith(idle));
         btn.setBackground(bg);
-        btn.setStateListAnimator(null); // keep our own pressed feedback
     }
 
     private static android.graphics.drawable.Drawable solidWith(int color) {
