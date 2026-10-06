@@ -203,8 +203,19 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
                 try {
                     if (!(param.thisObject instanceof Activity)) return;
                     Activity activity = (Activity) param.thisObject;
+                    String cls = activity.getClass().getName();
+                    // Unconditional trace: reveals which Activity actually hosts the app-info
+                    // page when reached through the "App management" list, and whether it is
+                    // rejected by isAppInfoHost() below. This is the only way to identify the
+                    // OEM-specific host class without guessing.
+                    XposedBridge.log(TAG + ": TRACE onCreate " + cls
+                            + " intent=" + describeIntent(activity)
+                            + " host=" + isAppInfoHost(cls));
                     final String pkg = resolvePkgForLifecycle(activity);
-                    if (pkg == null) return;
+                    if (pkg == null) {
+                        XposedBridge.log(TAG + ": TRACE   -> no pkg (rejected or unresolvable)");
+                        return;
+                    }
                     if (activity.isFinishing()) {
                         XposedBridge.log(TAG + ": [" + tagCtx + "] transient activity for "
                                 + pkg + " (" + activity.getClass().getSimpleName()
@@ -778,6 +789,10 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
                                 // Content-based fallback: a generic shell hosting the app-info
                                 // screen is accepted when the page shows the "强行停止" action.
                                 final String pkg = resolvePkgForLifecycle(act, decor);
+                                XposedBridge.log(TAG + ": TRACE layout " + act.getClass().getName()
+                                        + " host=" + isAppInfoHost(act.getClass().getName())
+                                        + " contentLooksAppInfo=" + looksLikeAppInfoContent(decor)
+                                        + " pkg=" + pkg);
                                 if (pkg == null) {
                                     // Dump the full context once per Activity so the OEM-specific
                                     // package-passing mechanism can be identified from logs.
@@ -835,6 +850,38 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             }
         }
         return null;
+    }
+
+    /** Compact, log-safe description of an Activity's Intent (action / data / extras keys). */
+    private static String describeIntent(Activity a) {
+        try {
+            Intent i = a.getIntent();
+            if (i == null) return "intent=null";
+            StringBuilder sb = new StringBuilder();
+            sb.append("action=").append(i.getAction());
+            sb.append(" data=").append(i.getData());
+            sb.append(" comp=").append(i.getComponent());
+            android.os.Bundle b = i.getExtras();
+            if (b != null && !b.isEmpty()) {
+                sb.append(" extras{");
+                boolean first = true;
+                for (String k : b.keySet()) {
+                    if (!first) sb.append(", ");
+                    first = false;
+                    Object v = b.get(k);
+                    String vs = v == null ? "null"
+                            : (v instanceof String ? (String) v : v.getClass().getSimpleName());
+                    if (vs != null && vs.length() > 40) vs = vs.substring(0, 40) + "…";
+                    sb.append(k).append('=').append(vs);
+                }
+                sb.append('}');
+            } else {
+                sb.append(" extras{}");
+            }
+            return sb.toString();
+        } catch (Throwable t) {
+            return "intent=<err " + t + ">";
+        }
     }
 
     private static final java.util.Set<String> LOGGED_ONCE = new java.util.HashSet<>();
@@ -1250,20 +1297,25 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
      * list stays short and meaningful.
      */
     private static List<String> queryFrozenPackages(Context ctx) {
-        List<String> out = new ArrayList<>();
-        if (ctx == null) return out;
+        // Keyed by package so we can sort by "most recently touched" below.
+        java.util.Map<String, Long> frozen = new java.util.LinkedHashMap<>();
+        if (ctx == null) return new ArrayList<>();
         PackageManager pm = ctx.getPackageManager();
         try {
             List<ApplicationInfo> apps =
                     pm.getInstalledApplications(PackageManager.MATCH_DISABLED_COMPONENTS);
-            if (apps == null) return out;
+            if (apps == null) return new ArrayList<>();
             for (ApplicationInfo ai : apps) {
                 if (ai == null || ai.packageName == null) continue;
                 if (ai.packageName.equals(MODULE_PKG)) continue;
                 try {
                     if (pm.getApplicationEnabledSetting(ai.packageName)
                             == PackageManager.COMPONENT_ENABLED_STATE_DISABLED_USER) {
-                        out.add(ai.packageName);
+                        // Sort key = the moment we froze it. Packages frozen before this
+                        // session (or by other means) have no record and sink to the bottom,
+                        // ordered by name.
+                        Long remembered = freezeTimeOf(ai.packageName);
+                        frozen.put(ai.packageName, remembered == null ? Long.MIN_VALUE : remembered);
                     }
                 } catch (Throwable ignored) {
                 }
@@ -1271,8 +1323,40 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
         } catch (Throwable t) {
             logOnce("queryFrozenPackages failed: " + t);
         }
-        java.util.Collections.sort(out);
+        // Most recently frozen/updated first — matches "which one did I just freeze?".
+        List<String> out = new ArrayList<>(frozen.keySet());
+        java.util.Collections.sort(out, (a, b) -> {
+            long ta = frozen.get(a), tb = frozen.get(b);
+            int c = Long.compare(tb, ta);          // descending
+            return c != 0 ? c : a.compareToIgnoreCase(b);
+        });
         return out;
+    }
+
+    /** In-memory record of when we froze a package, used only for list ordering. */
+    private static final java.util.Map<String, Long> FREEZE_TIMES =
+            java.util.Collections.synchronizedMap(new java.util.HashMap<String, Long>());
+
+    private static void markFrozenAt(String pkg) {
+        try {
+            FREEZE_TIMES.put(pkg, System.currentTimeMillis());
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void clearFrozenAt(String pkg) {
+        try {
+            FREEZE_TIMES.remove(pkg);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static Long freezeTimeOf(String pkg) {
+        try {
+            return FREEZE_TIMES.get(pkg);
+        } catch (Throwable t) {
+            return null;
+        }
     }
 
     /**
@@ -1297,9 +1381,12 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
         try {
             final PackageManager pm = activity.getPackageManager();
             final List<String> frozen = queryFrozenPackages(activity);
+
+            // Dismiss first in every branch, so an empty list can never leave a stale dialog.
+            dismissListDialog();
+
             if (frozen.isEmpty()) {
-                dismissListDialog();
-                toast(activity, "当前没有已冻结的应用", Toast.LENGTH_SHORT);
+                showEmptyState(activity);
                 return;
             }
 
@@ -1320,7 +1407,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             final TextView hint = new TextView(activity);
             hint.setText("点击任意一行即可解冻");
             hint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f);
-            hint.setTextColor(0xFF8A8A8A);
+            hint.setTextColor(0xFF707070);
             hint.setPadding(dp(activity, 12), dp(activity, 0), dp(activity, 12), dp(activity, 8));
             list.addView(hint);
 
@@ -1331,9 +1418,6 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
 
             ScrollView scroll = new ScrollView(activity);
             scroll.addView(list);
-
-            // Dismiss the previous instance BEFORE building the new one.
-            dismissListDialog();
 
             android.app.AlertDialog dialog = new android.app.AlertDialog.Builder(activity)
                     .setView(scroll)
@@ -1368,6 +1452,113 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
         } catch (Throwable t) {
             logOnce("dismissListDialog failed: " + t);
             activeListDialog = null;
+        }
+    }
+
+    /**
+     * Empty state shown INSIDE the dialog rather than as a transient Toast, so the user has a
+     * persistent, readable explanation instead of a message that disappears before it lands.
+     */
+    private void showEmptyState(Activity activity) {
+        try {
+            LinearLayout box = new LinearLayout(activity);
+            box.setOrientation(LinearLayout.VERTICAL);
+            box.setGravity(Gravity.CENTER);
+            int pad = dp(activity, 32);
+            box.setPadding(pad, pad, pad, pad);
+
+            TextView icon = new TextView(activity);
+            icon.setText("❄");
+            icon.setTextSize(TypedValue.COMPLEX_UNIT_SP, 34f);
+            icon.setGravity(Gravity.CENTER);
+            box.addView(icon);
+
+            TextView title = new TextView(activity);
+            title.setText("暂无已冻结应用");
+            title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f);
+            title.setTypeface(Typeface.DEFAULT_BOLD);
+            title.setTextColor(0xFF1A1A1A);
+            title.setGravity(Gravity.CENTER);
+            title.setPadding(0, dp(activity, 12), 0, 0);
+            box.addView(title);
+
+            TextView sub = new TextView(activity);
+            sub.setText("在应用信息页点击「冻结此应用」\n被冻结的应用会出现在这里");
+            sub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f);
+            sub.setTextColor(0xFF707070);
+            sub.setGravity(Gravity.CENTER);
+            sub.setLineSpacing(dp(activity, 4), 1f);
+            sub.setPadding(0, dp(activity, 8), 0, 0);
+            box.addView(sub);
+
+            android.app.AlertDialog dialog = new android.app.AlertDialog.Builder(activity)
+                    .setView(box)
+                    .setPositiveButton("知道了", null)
+                    .create();
+            dialog.setCanceledOnTouchOutside(true);
+            activeListDialog = dialog;
+            dialog.setOnDismissListener(new android.content.DialogInterface.OnDismissListener() {
+                @Override
+                public void onDismiss(android.content.DialogInterface d) {
+                    if (activeListDialog == d) activeListDialog = null;
+                }
+            });
+            dialog.show();
+            XposedBridge.log(TAG + ": empty state shown");
+        } catch (Throwable t) {
+            logOnce("showEmptyState failed: " + t);
+            toast(activity, "当前没有已冻结的应用", Toast.LENGTH_SHORT);
+        }
+    }
+
+    /**
+     * Undo affordance after unfreezing: a short Toast with an "撤销" action that re-freezes the
+     * package. Unfreezing is reversible, so a one-tap undo is cheaper than a confirmation
+     * dialog would be.
+     */
+    private void toastWithUndo(final Activity activity, final String pkg, final String label) {
+        try {
+            final android.widget.Toast t = android.widget.Toast.makeText(
+                    activity, "已解冻 " + label + "　撤销", Toast.LENGTH_LONG);
+            // Toast#setAction is a hidden API; reach it reflectively and degrade gracefully
+            // to a plain toast (with an "撤销" hint) when the ROM does not expose it.
+            try {
+                java.lang.reflect.Method setAction = t.getClass().getMethod(
+                        "setAction", android.view.View.OnClickListener.class, CharSequence.class);
+                setAction.invoke(t, new android.view.View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        undoFreeze(activity, pkg, label);
+                    }
+                }, "撤销");
+            } catch (Throwable hidden) {
+                XposedBridge.log(TAG + ": Toast.setAction unavailable (" + hidden
+                        + "), falling back to plain toast");
+            }
+            t.show();
+        } catch (Throwable t) {
+            logOnce("toastWithUndo failed: " + t);
+            toast(activity, "已解冻 " + label, Toast.LENGTH_SHORT);
+        }
+    }
+
+    /** Re-freezes a package from the undo affordance. */
+    private void undoFreeze(final Activity activity, final String pkg, final String label) {
+        try {
+            pmsSetEnabled(activity.getPackageManager(), pkg,
+                    PackageManager.COMPONENT_ENABLED_STATE_DISABLED_USER);
+            int st = safeEnabledState(activity.getPackageManager(), pkg);
+            if (isFrozen(st)) {
+                markFrozenAt(pkg);
+                toast(activity, "已恢复冻结 " + label, Toast.LENGTH_SHORT);
+                showFrozenList(activity);
+            } else {
+                toast(activity, "撤销失败，系统拒绝了停用请求", Toast.LENGTH_LONG);
+            }
+            XposedBridge.log(TAG + ": undo freeze for " + pkg + " -> " + st);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": undo failed for " + pkg + ": " + t);
+            toast(activity, "撤销失败", Toast.LENGTH_LONG);
         }
     }
 
@@ -1455,7 +1646,8 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
                 XposedBridge.log(TAG + ": unfreeze rejected for " + pkg + ", state=" + now);
                 return;
             }
-            toast(activity, "已解冻 " + safeAppLabel(activity, pm, pkg), Toast.LENGTH_SHORT);
+            clearFrozenAt(pkg);
+            toastWithUndo(activity, pkg, safeAppLabel(activity, pm, pkg));
             XposedBridge.log(TAG + ": unfrozen from list: " + pkg);
 
             // Re-query and rebuild. The previous dialog is dismissed inside showFrozenList(),
@@ -1478,7 +1670,8 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
                 toast(activity, "解冻失败（可能被系统拦截）", Toast.LENGTH_LONG);
                 return;
             }
-            toast(activity, "已解冻 " + safeAppLabel(activity, pm, pkg), Toast.LENGTH_SHORT);
+            clearFrozenAt(pkg);
+            toastWithUndo(activity, pkg, safeAppLabel(activity, pm, pkg));
             XposedBridge.log(TAG + ": unfrozen from list: " + pkg);
             // Remove the row and refresh the header count.
             try {
@@ -1545,6 +1738,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
                     ? !isFrozen(newState)
                     : isFrozen(newState);
 
+            if (isFrozen(newState)) markFrozenAt(pkg); else clearFrozenAt(pkg);
             updateLabel(btn, newState, pkg);
             refreshSiblingListBadge(btn);
             String msg = ok
