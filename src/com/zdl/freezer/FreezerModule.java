@@ -1210,7 +1210,15 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
                     dp(activity, 22), dp(activity, 12));
             btn.setElevation(dp(activity, 10));
             applyPill(btn, frozen);
-            updateLabel(btn, state, pkg);
+
+            // Resolve which Android user this page describes BEFORE the label is built, so the
+            // "[分身]" prefix and the user-scoped state read are both correct from the first
+            // frame. On OPlus MultiApp the clone's page runs in the owner's settings process, so
+            // this per-Activity lookup is the only thing that keeps a clone freeze from
+            // landing on the phone's original app.
+            resolveTargetUser(activity, pkg);
+            int scopedState = readEnabledStateFor(activity, pm, pkg);
+            updateLabel(btn, scopedState, pkg);
 
             LinearLayout.LayoutParams btnLp = new LinearLayout.LayoutParams(
                     LinearLayout.LayoutParams.WRAP_CONTENT,
@@ -1358,7 +1366,8 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
         PackageManager pm = ctx.getPackageManager();
         // Scoped to the user this Settings process belongs to, so a clone only ever lists (and
         // therefore only ever unfreezes) its OWN copies — never the owner's.
-        final int user = currentProcessUser();
+        final int user = ctx instanceof Activity
+                ? targetUserFor((Activity) ctx) : currentProcessUser();
         try {
             // getInstalledApplications already filters by the calling user's context.
             List<ApplicationInfo> apps =
@@ -1700,7 +1709,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
 
         try {
             pmsSetEnabled(pm, pkg, PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
-                    currentProcessUser());
+                    targetUserFor(activity));
 
             int now = safeEnabledState(pm, pkg);
             if (isFrozen(now)) {
@@ -1768,19 +1777,19 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
                 return;
             }
 
-            int s = safeEnabledState(pm, pkg);
+            int s = readEnabledStateFor(activity, pm, pkg);
             boolean wasFrozen = isFrozen(s);
             boolean wantFreeze = !wasFrozen;          // intent, not enum value
             int next = wantFreeze
                     ? PackageManager.COMPONENT_ENABLED_STATE_DISABLED_USER
                     : PackageManager.COMPONENT_ENABLED_STATE_ENABLED;
 
-            pmsSetEnabled(pm, pkg, next, currentProcessUser());
+            pmsSetEnabled(pm, pkg, next, targetUserFor(activity));
 
             // Read-back is the ONLY source of truth: setApplicationEnabledSetting() can silently
             // no-op when the caller lacks the signature permission, so we must verify the actual
             // state instead of assuming the call succeeded.
-            int newState = safeEnabledState(pm, pkg);
+            int newState = readEnabledStateFor(activity, pm, pkg);
             boolean nowFrozen = isFrozen(newState);
             boolean ok = (nowFrozen == wantFreeze);
 
@@ -1822,6 +1831,117 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
     private static volatile int cachedProcessUser = -1;
 
     /**
+     * Per-Activity override resolved from the app-info Intent.
+     *
+     * <p>Keyed by Activity identity: on OPlus MultiApp the clone's app-info page is rendered by
+     * the OWNER's settings process (user 0), so {@link #currentProcessUser()} alone always
+     * returns 0 and every freeze lands on the original app. The target user therefore has to
+     * come from the page itself, which is exactly what this map stores.
+     */
+    private static final java.util.Map<Activity, Integer> ACTIVITY_USER =
+            java.util.Collections.synchronizedMap(new java.util.WeakHashMap<Activity, Integer>());
+
+    /** The user id this Activity's freeze actions should target; -1 = not resolved yet. */
+    private static int targetUserFor(Activity a) {
+        if (a == null) return currentProcessUser();
+        try {
+            Integer v = ACTIVITY_USER.get(a);
+            if (v != null) return v;
+        } catch (Throwable ignored) {
+        }
+        return currentProcessUser();
+    }
+
+    private static void setTargetUserFor(Activity a, int user) {
+        try {
+            if (a != null) ACTIVITY_USER.put(a, user);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** Discovers which Android user the app-info page is describing. */
+    private static void resolveTargetUser(Activity activity, String pkg) {
+        if (activity == null) return;
+        int found = -1;
+        String how = "none";
+
+        // 1) Explicit user id in the Intent (some OEM builds pass EXTRA_USER_ID).
+        try {
+            Intent i = activity.getIntent();
+            if (i != null) {
+                android.os.Bundle b = i.getExtras();
+                if (b != null) {
+                    for (String key : new String[]{
+                            "android.intent.extra.USER_ID", "user_id", "userId",
+                            "user_handle", "android.intent.extra.USER"}) {
+                        Object v = b.get(key);
+                        if (v instanceof Integer) {
+                            int u = (Integer) v;
+                            if (u > 0) { found = u; how = "extra:" + key; break; }
+                        } else if (v instanceof android.os.UserHandle) {
+                            int u = userHandleToId((android.os.UserHandle) v);
+                            if (u > 0) { found = u; how = "extra:" + key; break; }
+                        }
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+
+        // 2) Declared user-serial field on the Activity (OEM shells often keep one).
+        if (found < 0) {
+            try {
+                for (Class<?> c = activity.getClass(); c != null && c != Activity.class;
+                     c = c.getSuperclass()) {
+                    for (java.lang.reflect.Field f : c.getDeclaredFields()) {
+                        String n = f.getName().toLowerCase();
+                        if (!n.contains("user") || n.contains("userid") || n.contains("userhandle")
+                                || n.contains("usermgr") || n.contains("usercache")) {
+                            continue;
+                        }
+                        f.setAccessible(true);
+                        Object v = f.get(activity);
+                        int u = -1;
+                        if (v instanceof Integer) {
+                            u = (Integer) v;
+                        } else if (v instanceof android.os.UserHandle) {
+                            u = userHandleToId((android.os.UserHandle) v);
+                        }
+                        if (u > 0) { found = u; how = "field:" + c.getSimpleName() + "." + f.getName(); break; }
+                    }
+                    if (found > 0) break;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+
+        // 3) The current process may itself be a clone user after all.
+        if (found < 0) {
+            int u = currentProcessUser();
+            if (u > 0) { found = u; how = "process"; }
+        }
+
+        if (found >= 0) {
+            setTargetUserFor(activity, found);
+            XposedBridge.log(TAG + ": target user for " + pkg + " = " + found + " (" + how + ")");
+        } else {
+            XposedBridge.log(TAG + ": target user for " + pkg
+                    + " = 0 (owner) — no clone marker found in this page");
+        }
+    }
+
+    private static int userHandleToId(android.os.UserHandle uh) {
+        try {
+            java.lang.reflect.Method m =
+                    android.os.UserHandle.class.getMethod("getIdentifier");
+            Object v = m.invoke(uh);
+            if (v instanceof Integer) return (Integer) v;
+        } catch (Throwable ignored) {
+        }
+        return -1;
+    }
+
+    /**
      * @return the Android user id owning the current process, or 0 when unknown.
      * Never throws; falls back to the owner user so behaviour stays predictable.
      */
@@ -1843,7 +1963,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
         return resolved;
     }
 
-    /** @return true when the current process runs in a secondary (clone) user. */
+    /** @return true when actions should target a secondary (clone) user. */
     private static boolean isCloneUser() {
         return currentProcessUser() != 0;
     }
@@ -1879,6 +1999,11 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
     /** User-aware replacement for the old state reader. */
     private int readEnabledState(PackageManager pm, String pkg) {
         return enabledStateForUser(pm, pkg, currentProcessUser());
+    }
+
+    /** User-aware read bound to a specific page (clone-aware). */
+    private int readEnabledStateFor(Activity a, PackageManager pm, String pkg) {
+        return enabledStateForUser(pm, pkg, targetUserFor(a));
     }
 
     /**
@@ -2015,15 +2140,17 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
         // In a clone user the label is prefixed so the user can never mistake the clone's
         // button for the owner app's one.
         String label = frozen ? "❄ 已冻结 · 点此解冻" : "❄ 冻结此应用";
-        if (isCloneUser()) {
-            label = (frozen ? "[分身] 已冻结 · 点此解冻" : "[分身] 冻结此应用");
+        if (targetUserFor((Activity) (btn.getContext() instanceof Activity
+                ? btn.getContext() : null)) != 0) {
+            label = frozen ? "[分身] 已冻结 · 点此解冻" : "[分身] 冻结此应用";
         }
         btn.setText(label);
         applyPill(btn, frozen);
         btn.setAlpha(block != null ? 0.55f : 1f);
 
         // Screen readers must hear both the action and the state, plus any block reason.
-        String scope = isCloneUser() ? "分身应用，" : "";
+        Activity act = (btn.getContext() instanceof Activity) ? (Activity) btn.getContext() : null;
+        String scope = (act != null && targetUserFor(act) != 0) ? "分身应用，" : "";
         String desc;
         if (block != null) {
             desc = scope + (frozen ? "已冻结，点此解冻" : "冻结此应用") + "。当前不可冻结：" + block;
