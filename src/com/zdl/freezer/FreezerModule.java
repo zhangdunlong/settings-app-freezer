@@ -605,6 +605,9 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
                             try {
                                 if (param.thisObject instanceof FreezerModule) return;
                                 dismissListDialog();
+                                if (param.thisObject instanceof Activity) {
+                                    clearBarHost((Activity) param.thisObject);
+                                }
                             } catch (Throwable ignored) {
                             }
                         }
@@ -1162,6 +1165,21 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
                 XposedBridge.log(TAG + ": injectButton has no parent for " + pkg);
                 return false;
             }
+
+            // CROSS-PARENT de-duplication.
+            //
+            // Two independent injection paths exist (ViewRootImpl.performTraversals targeting the
+            // DecorView, and the retry loop targeting android.R.id.content). They look at
+            // DIFFERENT containers, so a plain parent.findViewWithTag() check reports "absent"
+            // on the other one and BOTH end up injecting — which is how two identical bars ended
+            // up stacked on screen. Always check the whole window before adding anything.
+            if (isBarAlreadyInWindow(activity, parent) || isBarHost(activity)) {
+                XposedBridge.log(TAG + ": bar already present (window="
+                        + isBarAlreadyInWindow(activity, parent)
+                        + ", host=" + isBarHost(activity) + "), skipping duplicate for " + pkg);
+                return true;
+            }
+
             final PackageManager pm = activity.getPackageManager();
             int state = safeEnabledState(pm, pkg);
             final boolean frozen = isFrozen(state);
@@ -1238,6 +1256,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             });
 
             parent.addView(bar);
+            markBarHost(activity);
             bar.post(new Runnable() {
                 @Override
                 public void run() {
@@ -1927,6 +1946,75 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
      * Rounded pill background that darkens while pressed. Frozen pills get a lighter tint so
      * the state is readable at a glance without relying on the label alone.
      */
+    /**
+     * Window-wide de-duplication for the injected bar.
+     *
+     * <p>Walks the whole DecorView instead of a single container, because the two injection
+     * paths use different parents. Returns true when a bar (or its freeze button) is already
+     * attached anywhere in this window.
+     */
+    private static boolean isBarAlreadyInWindow(Activity activity, ViewGroup proposedParent) {
+        try {
+            View decor = activity.getWindow() != null
+                    ? activity.getWindow().getDecorView() : null;
+            if (decor instanceof ViewGroup) {
+                ViewGroup root = (ViewGroup) decor;
+                if (root.findViewWithTag(FROZEN_BAR_TAG) != null) return true;
+                if (root.findViewWithTag(FROZEN_TAG) != null) return true;
+            }
+        } catch (Throwable ignored) {
+        }
+        // Fallback: also inspect the parent we are about to use.
+        try {
+            if (proposedParent != null) {
+                if (proposedParent.findViewWithTag(FROZEN_BAR_TAG) != null) return true;
+                if (proposedParent.findViewWithTag(FROZEN_TAG) != null) return true;
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
+    }
+
+    /**
+     * Last-resort guard: the Activity that currently hosts the bar.
+     *
+     * <p>The two injection paths use different containers, so in the rare case where a stale
+     * view is detached but its parent is still reachable through neither DecorView nor the
+     * proposed parent, this identity check still prevents a second bar. Keyed by Activity and
+     * cleared in {@link #hookActivityDestroy()}.
+     */
+    private static final java.util.Set<Activity> BAR_HOSTS =
+            java.util.Collections.newSetFromMap(
+                    new java.util.WeakHashMap<Activity, Boolean>());
+
+    private static boolean isBarHost(Activity a) {
+        try {
+            synchronized (BAR_HOSTS) {
+                return BAR_HOSTS.contains(a);
+            }
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private static void markBarHost(Activity a) {
+        try {
+            synchronized (BAR_HOSTS) {
+                BAR_HOSTS.add(a);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void clearBarHost(Activity a) {
+        try {
+            synchronized (BAR_HOSTS) {
+                BAR_HOSTS.remove(a);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
     /**
      * Rounded pill background with pressed AND focused states.
      *
