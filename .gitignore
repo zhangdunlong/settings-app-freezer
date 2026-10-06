@@ -55,3 +55,6 @@ desktop.ini
 __pycache__/
 *.pyc
 node_modules/
+
+# ---- Internal docs (not published) ----
+PUSH_TO_GITHUB.md
