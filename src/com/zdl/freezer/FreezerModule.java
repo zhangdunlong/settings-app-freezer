@@ -331,20 +331,97 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
         lastResolvedAt = System.currentTimeMillis();
     }
 
-    /** @return the remembered package if it is still fresh, else null. */
+    /**
+     * Host activities that may legitimately show the frozen-app bar.
+     *
+     * <p>This is a strict allow-list on purpose. It must be tight, because the remembered
+     * package is only valid while the user is still ON an app-info page. With a permissive
+     * check, returning to the Settings home screen within the memory window made the module
+     * re-inject the bar there (the home Activity is a plain shell with no package in its
+     * Intent, so it was silently borrowing the remembered package).
+     *
+     * <p>Accepted:
+     * <ul>
+     *   <li>{@code ...applications.InstalledAppDetails[Top]} — AOSP + ColorOS detail page</li>
+     *   <li>anything containing {@code AppInfo} / {@code AppDetails}</li>
+     * </ul>
+     * Rejected on purpose: {@code OplusSettingsHomepageActivity} (home shell),
+     * {@code AppListActivity} / {@code ApplicationsSettings} (the list),
+     * and the generic {@code SubSettings} (used for a dozen unrelated pages).
+     */
+    private static boolean isAppInfoHost(String cls) {
+        if (cls == null) return false;
+        String c = cls.toLowerCase();
+        // Hard denials first — these are the shells that caused the false positives.
+        if (c.contains("homepage") || c.contains("applist") || c.contains("applicationsettings")
+                || c.contains("dashboard") || c.contains("subsettings")) {
+            return false;
+        }
+        if (c.contains("installedappdetails") || c.contains("appinfo")
+                || c.contains("appdetails")) {
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Content-based fallback for app-info pages hosted by a generic shell (e.g. ColorOS may use
+     * {@code SubSettings} for the detail screen). The AOSP app-info page always exposes the
+     * "强行停止 / Force stop" action, so the presence of that button in the visible tree is a
+     * reliable signal.
+     */
+    private static boolean looksLikeAppInfoContent(View decor) {
+        try {
+            return containsForceStopLabel(decor, 0);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private static boolean containsForceStopLabel(View v, int depth) {
+        if (v == null || depth > 12) return false;
+        try {
+            if (v instanceof android.widget.TextView) {
+                CharSequence t = ((android.widget.TextView) v).getText();
+                if (t != null) {
+                    String s = t.toString();
+                    if (s.contains("强行停止") || s.contains("Force stop")
+                            || s.contains("强行停止应用") || s.contains("强停")) {
+                        return true;
+                    }
+                }
+            }
+            if (v instanceof android.view.ViewGroup) {
+                android.view.ViewGroup g = (android.view.ViewGroup) v;
+                for (int i = 0; i < g.getChildCount() && i < 200; i++) {
+                    if (containsForceStopLabel(g.getChildAt(i), depth + 1)) return true;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
+    }
+
+    /** @return the remembered package if it is still fresh AND we are on an app-info page. */
     private static String recallPkg(Activity activity) {
+        return recallPkg(activity, null);
+    }
+
+    private static String recallPkg(Activity activity, View decor) {
         String pkg = lastResolvedPkg;
         if (pkg == null) return null;
         if (System.currentTimeMillis() - lastResolvedAt > PKG_MEMORY_MS) {
             lastResolvedPkg = null;
             return null;
         }
-        // Only reuse it while we are still on an app-info screen. Note that the surviving
-        // parent activity on ColorOS may be a generic "SubSettings" shell, so the class-name
-        // test is intentionally permissive: what matters is that the window is still the one
-        // the user navigated to, which we approximate by requiring an app-info-ish title or a
-        // still-fresh timestamp.
+        // Strict: the window must belong to a known app-info host. This prevents the bar from
+        // reappearing on the Settings home screen, app list, or any other unrelated page.
         try {
+            boolean host = isAppInfoHost(activity.getClass().getName())
+                    || (decor != null && looksLikeAppInfoContent(decor));
+            if (!host) {
+                return null;
+            }
             PackageManager pm = activity.getPackageManager();
             if (pm.getApplicationInfo(pkg, 0) == null) {
                 lastResolvedPkg = null;
@@ -356,7 +433,29 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
         return pkg;
     }
 
+
     private static String resolvePkgForLifecycle(Activity activity) {
+        return resolvePkgForLifecycle(activity, null);
+    }
+
+    private static String resolvePkgForLifecycle(Activity activity, View decor) {
+        // HARD GUARD: never touch a window that is not an app-info host. Without this, the
+        // Settings home screen (and any other shell Activity) would be scanned and would
+        // eventually resolve some package, making the bar appear all over the Settings app.
+        boolean host = isAppInfoHost(activity.getClass().getName());
+        if (!host && decor != null) {
+            // A generic shell (e.g. SubSettings) is acceptable only when the visible content
+            // is unmistakably the app-info screen.
+            host = looksLikeAppInfoContent(decor);
+            if (host) {
+                logOnce("app-info content detected inside generic shell "
+                        + activity.getClass().getName());
+            }
+        }
+        if (!host) {
+            return null;
+        }
+
         String pkg = resolveTargetPackage(activity);
         if (pkg != null) {
             rememberPkg(pkg);
@@ -369,7 +468,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             rememberPkg(pkg);
             return pkg;
         }
-        return recallPkg(activity);
+        return recallPkg(activity, decor);
     }
 
     /** Reflectively scan the Activity's own fields for a plausible installed package name. */
@@ -654,7 +753,9 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
                                             + " ctx=" + decor.getContext().getClass().getName());
                                     return;
                                 }
-                                final String pkg = resolvePkgForLifecycle(act);
+                                // Content-based fallback: a generic shell hosting the app-info
+                                // screen is accepted when the page shows the "强行停止" action.
+                                final String pkg = resolvePkgForLifecycle(act, decor);
                                 if (pkg == null) {
                                     // Dump the full context once per Activity so the OEM-specific
                                     // package-passing mechanism can be identified from logs.
