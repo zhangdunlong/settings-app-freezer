@@ -141,7 +141,9 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
 
     @Override
     public void initZygote(StartupParam startupParam) {
-        XposedBridge.log(TAG + ": initZygote, module loaded, API=" + android.os.Build.VERSION.SDK_INT);
+        XposedBridge.log(TAG + ": initZygote, module loaded, API=" + android.os.Build.VERSION.SDK_INT
+                + " user=" + currentProcessUser()
+                + (isCloneUser() ? " (CLONE/SECONDARY user — actions are scoped to it)" : ""));
     }
 
     @Override
@@ -1354,7 +1356,11 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
         java.util.Map<String, Long> frozen = new java.util.LinkedHashMap<>();
         if (ctx == null) return new ArrayList<>();
         PackageManager pm = ctx.getPackageManager();
+        // Scoped to the user this Settings process belongs to, so a clone only ever lists (and
+        // therefore only ever unfreezes) its OWN copies — never the owner's.
+        final int user = currentProcessUser();
         try {
+            // getInstalledApplications already filters by the calling user's context.
             List<ApplicationInfo> apps =
                     pm.getInstalledApplications(PackageManager.MATCH_DISABLED_COMPONENTS);
             if (apps == null) return new ArrayList<>();
@@ -1362,7 +1368,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
                 if (ai == null || ai.packageName == null) continue;
                 if (ai.packageName.equals(MODULE_PKG)) continue;
                 try {
-                    if (pm.getApplicationEnabledSetting(ai.packageName)
+                    if (enabledStateForUser(pm, ai.packageName, user)
                             == PackageManager.COMPONENT_ENABLED_STATE_DISABLED_USER) {
                         // Sort key = the moment we froze it. Packages frozen before this
                         // session (or by other means) have no record and sink to the bottom,
@@ -1600,7 +1606,8 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
     private void undoFreeze(final Activity activity, final String pkg, final String label) {
         try {
             pmsSetEnabled(activity.getPackageManager(), pkg,
-                    PackageManager.COMPONENT_ENABLED_STATE_DISABLED_USER);
+                    PackageManager.COMPONENT_ENABLED_STATE_DISABLED_USER,
+                    currentProcessUser());
             int st = safeEnabledState(activity.getPackageManager(), pkg);
             if (isFrozen(st)) {
                 invalidateFrozenCount();
@@ -1692,7 +1699,8 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
         if (row != null) row.setEnabled(false);
 
         try {
-            pmsSetEnabled(pm, pkg, PackageManager.COMPONENT_ENABLED_STATE_ENABLED);
+            pmsSetEnabled(pm, pkg, PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
+                    currentProcessUser());
 
             int now = safeEnabledState(pm, pkg);
             if (isFrozen(now)) {
@@ -1767,7 +1775,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
                     ? PackageManager.COMPONENT_ENABLED_STATE_DISABLED_USER
                     : PackageManager.COMPONENT_ENABLED_STATE_ENABLED;
 
-            pmsSetEnabled(pm, pkg, next);
+            pmsSetEnabled(pm, pkg, next, currentProcessUser());
 
             // Read-back is the ONLY source of truth: setApplicationEnabledSetting() can silently
             // no-op when the caller lacks the signature permission, so we must verify the actual
@@ -1795,19 +1803,100 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
         }
     }
 
+    // ======================================================================
+    // Clone / secondary-user awareness
+    //
+    // App clones (App Twin / 分身, OPlus MultiApp, Samsung Secure Folder) are NOT separate
+    // packages: the clone shares the SAME package name but is installed for a DIFFERENT
+    // Android user (observed on this device: 0 = owner, 998/999 = MultiApp clones).
+    //
+    // PackageManager.setApplicationEnabledSetting(pkg, state, userId) only affects the given
+    // user. Passing a hard-coded 0 therefore ALWAYS targets the owner copy — which is why
+    // freezing "the clone" from inside the clone's app-info page silently froze the phone's
+    // original app instead.
+    //
+    // Fix: resolve the user id of the settings process we are running in, and use THAT.
+    // ======================================================================
+
+    /** Cached clone user for the current Settings process. */
+    private static volatile int cachedProcessUser = -1;
+
+    /**
+     * @return the Android user id owning the current process, or 0 when unknown.
+     * Never throws; falls back to the owner user so behaviour stays predictable.
+     */
+    private static int currentProcessUser() {
+        int c = cachedProcessUser;
+        if (c >= 0) return c;
+        int resolved = 0;
+        try {
+            // android.os.UserHandle.myUserId() is not in the public android.jar stub, and this
+            // module compiles against the stub only, so reach it reflectively.
+            Class<?> uh = Class.forName("android.os.UserHandle");
+            java.lang.reflect.Method m = uh.getMethod("myUserId");
+            Object v = m.invoke(null);
+            if (v instanceof Integer) resolved = (Integer) v;
+        } catch (Throwable t) {
+            resolved = 0;
+        }
+        cachedProcessUser = resolved;
+        return resolved;
+    }
+
+    /** @return true when the current process runs in a secondary (clone) user. */
+    private static boolean isCloneUser() {
+        return currentProcessUser() != 0;
+    }
+
+    /**
+     * Reads the enabled state for a specific user.
+     *
+     * <p>{@code getApplicationEnabledSetting} always reads the owner user, so for clone users we
+     * must go through the user-aware {@code IPackageManager} path instead.
+     */
+    private static int enabledStateForUser(PackageManager pm, String pkg, int userId) {
+        if (userId == 0) {
+            try {
+                return pm.getApplicationEnabledSetting(pkg);
+            } catch (Throwable t) {
+                return PackageManager.COMPONENT_ENABLED_STATE_DEFAULT;
+            }
+        }
+        try {
+            // Compile-time-free reflective call: keeps the 2-arg hidden API off the
+            // verification path on Android 16 while still reading the clone's real state.
+            java.lang.reflect.Method m = PackageManager.class.getMethod(
+                    "getApplicationEnabledSetting", String.class, int.class);
+            Object v = m.invoke(pm, pkg, userId);
+            if (v instanceof Integer) return (Integer) v;
+        } catch (Throwable t) {
+            logOnce("enabledStateForUser(" + userId + ") via reflection failed: " + t);
+        }
+        // Fallback: assume default so the UI still renders and the user can retry.
+        return PackageManager.COMPONENT_ENABLED_STATE_DEFAULT;
+    }
+
+    /** User-aware replacement for the old state reader. */
+    private int readEnabledState(PackageManager pm, String pkg) {
+        return enabledStateForUser(pm, pkg, currentProcessUser());
+    }
+
     /**
      * setApplicationEnabledSetting is a one-arg-hidden-API on some releases; go through
      * reflection so a signature change on Android 16 cannot crash the tap handler.
+     *
+     * <p>{@code userId} is what makes clone-scoped freezing possible — passing 0 (the previous
+     * hard-coded value) would always target the owner's copy.
      */
-    private void pmsSetEnabled(PackageManager pm, String pkg, int state) {
+    private void pmsSetEnabled(PackageManager pm, String pkg, int state, int userId) {
         try {
-            pm.setApplicationEnabledSetting(pkg, state, 0);
+            pm.setApplicationEnabledSetting(pkg, state, userId);
         } catch (NoSuchMethodError | AbstractMethodError err) {
             XposedBridge.log(TAG + ": direct setApplicationEnabledSetting missing, using reflection");
             try {
                 java.lang.reflect.Method m = PackageManager.class.getMethod(
                         "setApplicationEnabledSetting", String.class, int.class, int.class);
-                m.invoke(pm, pkg, state, 0);
+                m.invoke(pm, pkg, state, userId);
             } catch (Throwable t) {
                 throw new RuntimeException(t);
             }
@@ -1815,12 +1904,9 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
     }
 
     private int safeEnabledState(PackageManager pm, String pkg) {
-        try {
-            return pm.getApplicationEnabledSetting(pkg);
-        } catch (Throwable t) {
-            return PackageManager.COMPONENT_ENABLED_STATE_DEFAULT;
-        }
+        return readEnabledState(pm, pkg);
     }
+
 
     // ------------------------------------------------------------------
     // Safety + diagnostics
@@ -1926,18 +2012,23 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
         }
 
         // Text carries the state, so the UI never depends on colour alone (WCAG 1.4.1).
-        // A distinct glyph reinforces it: snowflake = frozen, hollow snowflake = available.
+        // In a clone user the label is prefixed so the user can never mistake the clone's
+        // button for the owner app's one.
         String label = frozen ? "❄ 已冻结 · 点此解冻" : "❄ 冻结此应用";
+        if (isCloneUser()) {
+            label = (frozen ? "[分身] 已冻结 · 点此解冻" : "[分身] 冻结此应用");
+        }
         btn.setText(label);
         applyPill(btn, frozen);
         btn.setAlpha(block != null ? 0.55f : 1f);
 
         // Screen readers must hear both the action and the state, plus any block reason.
+        String scope = isCloneUser() ? "分身应用，" : "";
         String desc;
         if (block != null) {
-            desc = (frozen ? "已冻结，点此解冻" : "冻结此应用") + "。当前不可冻结：" + block;
+            desc = scope + (frozen ? "已冻结，点此解冻" : "冻结此应用") + "。当前不可冻结：" + block;
         } else {
-            desc = frozen ? "已冻结，点此解冻" : "冻结此应用";
+            desc = scope + (frozen ? "已冻结，点此解冻" : "冻结此应用");
         }
         btn.setContentDescription(desc);
     }
