@@ -1276,16 +1276,50 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
         return t;
     }
 
+    /**
+     * Cached frozen-count, so the badge does not trigger a full
+     * {@code getInstalledApplications()} scan on every tap.
+     *
+     * <p>{@code getInstalledApplications} costs roughly 100ms on a device with a few hundred
+     * apps and runs on the UI thread, which made freezing feel laggy. The cache is only
+     * consulted by the badge; opening the list always performs a fresh scan, so the user can
+     * never act on stale data. {@link #invalidateFrozenCount()} is called after every state
+     * change, and a short TTL guards against other apps freezing themselves.
+     */
+    private static volatile int cachedFrozenCount = -1;
+    private static volatile long cachedCountAt = 0L;
+    private static final long COUNT_CACHE_MS = 1500L;
+
+    private static void invalidateFrozenCount() {
+        cachedFrozenCount = -1;
+        cachedCountAt = 0L;
+    }
+
+    private static int frozenCountFor(Context ctx) {
+        long now = System.currentTimeMillis();
+        int c = cachedFrozenCount;
+        if (c >= 0 && now - cachedCountAt < COUNT_CACHE_MS) return c;
+        int fresh = queryFrozenPackages(ctx).size();
+        cachedFrozenCount = fresh;
+        cachedCountAt = now;
+        return fresh;
+    }
+
     /** Updates the list button label with the current frozen-app count. */
     private static void refreshListBadge(TextView listBtn) {
         try {
-            int n = queryFrozenPackages(listBtn.getContext()).size();
+            int n = frozenCountFor(listBtn.getContext());
             listBtn.setText(n > 0 ? ("❄ 已冻结 " + n) : "❄ 已冻结 0");
             listBtn.setAlpha(n > 0 ? 1f : 0.6f);
+            // Never rely on colour alone — the label text already carries the state, and this
+            // description makes the badge distinguishable for screen readers next to the
+            // primary freeze button.
+            listBtn.setContentDescription("查看已冻结应用列表，当前 " + n + " 个");
         } catch (Throwable t) {
             listBtn.setText("❄ 已冻结");
         }
     }
+
 
     // ------------------------------------------------------------------
     // Frozen-apps list
@@ -1380,6 +1414,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
     private void showFrozenList(final Activity activity) {
         try {
             final PackageManager pm = activity.getPackageManager();
+            invalidateFrozenCount();          // the list must never render cached data
             final List<String> frozen = queryFrozenPackages(activity);
 
             // Dismiss first in every branch, so an empty list can never leave a stale dialog.
@@ -1549,6 +1584,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
                     PackageManager.COMPONENT_ENABLED_STATE_DISABLED_USER);
             int st = safeEnabledState(activity.getPackageManager(), pkg);
             if (isFrozen(st)) {
+                invalidateFrozenCount();
                 markFrozenAt(pkg);
                 toast(activity, "已恢复冻结 " + label, Toast.LENGTH_SHORT);
                 showFrozenList(activity);
@@ -1646,6 +1682,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
                 XposedBridge.log(TAG + ": unfreeze rejected for " + pkg + ", state=" + now);
                 return;
             }
+            invalidateFrozenCount();
             clearFrozenAt(pkg);
             toastWithUndo(activity, pkg, safeAppLabel(activity, pm, pkg));
             XposedBridge.log(TAG + ": unfrozen from list: " + pkg);
@@ -1660,32 +1697,6 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
         }
     }
 
-    private void unfreezeFromList(final Activity activity, final PackageManager pm,
-                                         final String pkg, final LinearLayout parentList) {
-        try {
-            pm.setApplicationEnabledSetting(pkg,
-                    PackageManager.COMPONENT_ENABLED_STATE_ENABLED, 0);
-            int now = safeEnabledState(pm, pkg);
-            if (isFrozen(now)) {
-                toast(activity, "解冻失败（可能被系统拦截）", Toast.LENGTH_LONG);
-                return;
-            }
-            clearFrozenAt(pkg);
-            toastWithUndo(activity, pkg, safeAppLabel(activity, pm, pkg));
-            XposedBridge.log(TAG + ": unfrozen from list: " + pkg);
-            // Remove the row and refresh the header count.
-            try {
-                parentList.removeView((View) parentList.getParent());
-            } catch (Throwable ignored) {
-            }
-            // Simplest robust refresh: rebuild the whole list.
-            showFrozenList(activity);
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + ": unfreezeFromList failed for " + pkg + ": " + t);
-            toast(activity, "解冻失败：" + t.getMessage(), Toast.LENGTH_LONG);
-        }
-    }
-
     private static String safeAppLabel(Context ctx, PackageManager pm, String pkg) {
         try {
             ApplicationInfo ai = pm.getApplicationInfo(pkg, 0);
@@ -1694,6 +1705,11 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
         } catch (Throwable ignored) {
         }
         return pkg;
+    }
+
+    /** Short alias used in toasts so the user sees the app name, not the package. */
+    private static String labelOf(PackageManager pm, String pkg) {
+        return safeAppLabel(null, pm, pkg);
     }
 
     /** A light rounded background that darkens on press, for list rows. */
@@ -1726,27 +1742,31 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             }
 
             int s = safeEnabledState(pm, pkg);
-            boolean frozen = isFrozen(s);
-            int next = frozen
-                    ? PackageManager.COMPONENT_ENABLED_STATE_ENABLED
-                    : PackageManager.COMPONENT_ENABLED_STATE_DISABLED_USER;
+            boolean wasFrozen = isFrozen(s);
+            boolean wantFreeze = !wasFrozen;          // intent, not enum value
+            int next = wantFreeze
+                    ? PackageManager.COMPONENT_ENABLED_STATE_DISABLED_USER
+                    : PackageManager.COMPONENT_ENABLED_STATE_ENABLED;
 
             pmsSetEnabled(pm, pkg, next);
 
+            // Read-back is the ONLY source of truth: setApplicationEnabledSetting() can silently
+            // no-op when the caller lacks the signature permission, so we must verify the actual
+            // state instead of assuming the call succeeded.
             int newState = safeEnabledState(pm, pkg);
-            boolean ok = (next == PackageManager.COMPONENT_ENABLED_STATE_ENABLED)
-                    ? !isFrozen(newState)
-                    : isFrozen(newState);
+            boolean nowFrozen = isFrozen(newState);
+            boolean ok = (nowFrozen == wantFreeze);
 
-            if (isFrozen(newState)) markFrozenAt(pkg); else clearFrozenAt(pkg);
+            invalidateFrozenCount();
+            if (nowFrozen) markFrozenAt(pkg); else clearFrozenAt(pkg);
             updateLabel(btn, newState, pkg);
             refreshSiblingListBadge(btn);
             String msg = ok
-                    ? ((next == PackageManager.COMPONENT_ENABLED_STATE_ENABLED)
-                        ? "已解冻 " + pkg : "已冻结 " + pkg)
+                    ? (wantFreeze ? "已冻结 " + labelOf(pm, pkg) : "已解冻 " + labelOf(pm, pkg))
                     : "操作未生效（可能被系统/安全软件拦截）";
             toast(activity, msg, ok ? Toast.LENGTH_SHORT : Toast.LENGTH_LONG);
-            XposedBridge.log(TAG + ": " + msg + " target=" + next + " readback=" + newState);
+            XposedBridge.log(TAG + ": " + msg + " want=" + (wantFreeze ? "FREEZE" : "ENABLE")
+                    + " readback=" + newState);
         } catch (SecurityException se) {
             toast(activity, "无权限停用该应用（需系统签名权限）", Toast.LENGTH_LONG);
             XposedBridge.log(TAG + ": SecurityException for " + pkg + ": " + se);
@@ -1873,25 +1893,78 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
         boolean frozen = isFrozen(state);
         String block = null;
         try {
-            block = criticalReason((Activity) btn.getContext(), btn.getContext().getPackageManager(), pkg);
+            // The button context is the Activity we injected into, but never assume it: a
+            // ContextThemeWrapper (dialogs use one) would make a blind cast throw.
+            Context ctx = btn.getContext();
+            if (ctx instanceof Activity) {
+                block = criticalReason((Activity) ctx, ctx.getPackageManager(), pkg);
+            } else if (ctx instanceof ContextWrapper
+                    && ((ContextWrapper) ctx).getBaseContext() instanceof Activity) {
+                Activity a = (Activity) ((ContextWrapper) ctx).getBaseContext();
+                block = criticalReason(a, a.getPackageManager(), pkg);
+            }
         } catch (Throwable ignored) {
         }
-        btn.setText(frozen ? "❄ 已冻结 · 点此解冻" : "❄ 冻结此应用");
+
+        // Text carries the state, so the UI never depends on colour alone (WCAG 1.4.1).
+        // A distinct glyph reinforces it: snowflake = frozen, hollow snowflake = available.
+        String label = frozen ? "❄ 已冻结 · 点此解冻" : "❄ 冻结此应用";
+        btn.setText(label);
         applyPill(btn, frozen);
         btn.setAlpha(block != null ? 0.55f : 1f);
+
+        // Screen readers must hear both the action and the state, plus any block reason.
+        String desc;
+        if (block != null) {
+            desc = (frozen ? "已冻结，点此解冻" : "冻结此应用") + "。当前不可冻结：" + block;
+        } else {
+            desc = frozen ? "已冻结，点此解冻" : "冻结此应用";
+        }
+        btn.setContentDescription(desc);
     }
 
     /**
      * Rounded pill background that darkens while pressed. Frozen pills get a lighter tint so
      * the state is readable at a glance without relying on the label alone.
      */
+    /**
+     * Rounded pill background with pressed AND focused states.
+     *
+     * <p>Colour alone never encodes the state (the label text does too), and the focus ring
+     * keeps the control visible when navigating with a keyboard/trackball or switch device,
+     * which OEM themes would otherwise strip from a plain TextView.
+     */
     private static void applyPill(TextView btn, boolean frozen) {
         int idle = frozen ? ACCENT_FROZEN : ACCENT;
         int pressed = frozen ? ACCENT_FROZEN_PRESSED : ACCENT_PRESSED;
         StateListDrawable bg = new StateListDrawable();
+        bg.addState(new int[]{android.R.attr.state_focused}, ring(pressed));
         bg.addState(new int[]{android.R.attr.state_pressed}, solidWith(pressed));
         bg.addState(new int[]{}, solidWith(idle));
         btn.setBackground(bg);
+        btn.setFocusable(true);
+        btn.setClickable(true);
+    }
+
+    /** Pill with a visible focus ring so keyboard navigation stays legible. */
+    private static android.graphics.drawable.Drawable ring(int color) {
+        try {
+            GradientDrawable outer = new GradientDrawable();
+            outer.setShape(GradientDrawable.RECTANGLE);
+            outer.setCornerRadius(999);
+            outer.setColor(0x00000000);
+            outer.setStroke(6, color);
+
+            GradientDrawable inner = new GradientDrawable();
+            inner.setShape(GradientDrawable.RECTANGLE);
+            inner.setCornerRadius(999);
+            inner.setColor(color);
+
+            return new android.graphics.drawable.LayerDrawable(
+                    new android.graphics.drawable.Drawable[]{outer, inner});
+        } catch (Throwable t) {
+            return solidWith(color);
+        }
     }
 
     private static android.graphics.drawable.Drawable solidWith(int color) {
@@ -1903,7 +1976,12 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
     }
 
     private static int dp(Activity a, int value) {
-        return Math.round(a.getResources().getDisplayMetrics().density * value);
+        try {
+            float d = a.getResources().getDisplayMetrics().density;
+            return Math.round(value * d);
+        } catch (Throwable t) {
+            return Math.round(value * 3f);   // sensible fallback for a 3x display
+        }
     }
 
     private static void toast(Activity a, String msg, int len) {
