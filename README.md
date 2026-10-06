@@ -232,6 +232,11 @@ MAJOR×10000+...      →  AndroidManifest.xml: android:versionCode
 - **ColorOS 特定适配** —— 已处理两段式页面（`InstalledAppDetailsTop` 为空壳，
   真正渲染的是父页 `InstalledAppDetails`）；其他 ROM 的首次适配请提交 Issue
   并附 LSPosed 日志
+- **分身（App Twin）需页面携带 user 标识** —— 分身与原版是**同一包名、
+  不同 Android user**。本模块按应用信息页的 Intent / 字段解析目标 user，
+  但若厂商的详情页完全不带 user 线索，则无法自动区分，需手动指定作用域
+- **部分 ROM 的应用列表页可能无法识别** —— 「设置 → 应用 → 应用列表 → 点应用」
+  这条路径的包名传递方式依赖厂商实现，少数机型可能不显示按钮
 - **无法视觉验证的场景** —— 若设备处于锁屏状态，模块无法自证按钮已渲染，
   需解锁后人工确认
 
