@@ -80,6 +80,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
     private static final int FROZEN_TAG = 0x5f465252; // "FRZR"
     private static final int FROZEN_BAR_TAG = 0x5f465242;  // "FRRB" - the horizontal bar
     private static final int FROZEN_LIST_TAG = 0x5f464c53; // "FRLS" - frozen-list entry button
+    private static final int HEADER_TAG = 0x5f484452;      // "HRDR" - list header (count)
 
     private static final String ACTION_APP_DETAILS = "android.settings.APPLICATION_DETAILS_SETTINGS";
 
@@ -310,6 +311,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
         // (non 0x0) container on ColorOS, where the app-info Activity's own content and decor
         // views stay 0x0 for their entire lifetime.
         hookWindowLayout(cl);
+        hookActivityDestroy(cl);
     }
 
     /**
@@ -580,6 +582,26 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
         } catch (Throwable ignored) {
         }
         return null;
+    }
+
+    /** Hooks Activity destroy so a still-open list dialog never outlives its window. */
+    private void hookActivityDestroy(final ClassLoader cl) {
+        try {
+            XposedHelpers.findAndHookMethod("android.app.Activity", cl, "onDestroy",
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            try {
+                                if (param.thisObject instanceof FreezerModule) return;
+                                dismissListDialog();
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    });
+            XposedBridge.log(TAG + ": onDestroy hooked");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": FAILED to hook onDestroy: " + t);
+        }
     }
 
     private XC_MethodHook buildFocusHook() {
@@ -1257,11 +1279,26 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
      * Shows a dialog listing every frozen app. Tapping a row unfreezes it immediately and
      * refreshes the list in place.
      */
+    /**
+     * The single live list dialog, kept as a field so it can be dismissed and rebuilt instead
+     * of stacked. Without this, unfreezing an item called {@link #showFrozenList} again and
+     * left the previous dialog alive underneath — the user then saw a stale list whose rows no
+     * longer matched reality, and repeated taps kept piling up dialogs.
+     */
+    private android.app.AlertDialog activeListDialog;
+
+    /**
+     * Opens (or re-opens) the frozen-apps list.
+     *
+     * <p>Strictly single-instance: any previously open list dialog is dismissed before a new
+     * one is created, so at most one list is ever visible.
+     */
     private void showFrozenList(final Activity activity) {
         try {
             final PackageManager pm = activity.getPackageManager();
             final List<String> frozen = queryFrozenPackages(activity);
             if (frozen.isEmpty()) {
+                dismissListDialog();
                 toast(activity, "当前没有已冻结的应用", Toast.LENGTH_SHORT);
                 return;
             }
@@ -1272,24 +1309,46 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             list.setPadding(pad, pad, pad, pad);
 
             final TextView header = new TextView(activity);
-            header.setText("已冻结应用（" + frozen.size() + "）· 点击即可解冻");
+            header.setTag(HEADER_TAG);
+            header.setText("已冻结应用（" + frozen.size() + "）");
             header.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f);
             header.setTypeface(Typeface.DEFAULT_BOLD);
-            header.setTextColor(0xFF666666);
-            header.setPadding(dp(activity, 12), dp(activity, 6), dp(activity, 12), dp(activity, 10));
+            header.setTextColor(0xFF5A5A5A);
+            header.setPadding(dp(activity, 12), dp(activity, 6), dp(activity, 12), dp(activity, 4));
             list.addView(header);
 
+            final TextView hint = new TextView(activity);
+            hint.setText("点击任意一行即可解冻");
+            hint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f);
+            hint.setTextColor(0xFF8A8A8A);
+            hint.setPadding(dp(activity, 12), dp(activity, 0), dp(activity, 12), dp(activity, 8));
+            list.addView(hint);
+
+            final Refresh refresh = new Refresh();
             for (final String pkg : frozen) {
-                list.addView(buildFrozenRow(activity, pm, pkg, list));
+                list.addView(buildFrozenRow(activity, pm, pkg, refresh));
             }
 
             ScrollView scroll = new ScrollView(activity);
             scroll.addView(list);
 
-            final android.app.AlertDialog dialog = new android.app.AlertDialog.Builder(activity)
+            // Dismiss the previous instance BEFORE building the new one.
+            dismissListDialog();
+
+            android.app.AlertDialog dialog = new android.app.AlertDialog.Builder(activity)
                     .setView(scroll)
                     .setPositiveButton("关闭", null)
                     .create();
+            dialog.setCanceledOnTouchOutside(true);
+            activeListDialog = dialog;
+            // Clear the field when the user closes it, so a later check does not
+            // try to dismiss a dead window.
+            dialog.setOnDismissListener(new android.content.DialogInterface.OnDismissListener() {
+                @Override
+                public void onDismiss(android.content.DialogInterface d) {
+                    if (activeListDialog == d) activeListDialog = null;
+                }
+            });
             dialog.show();
 
             XposedBridge.log(TAG + ": frozen list shown, " + frozen.size() + " entries");
@@ -1299,14 +1358,38 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
         }
     }
 
+    /** Dismisses the list dialog if one is showing. Safe to call repeatedly. */
+    private void dismissListDialog() {
+        try {
+            if (activeListDialog != null) {
+                if (activeListDialog.isShowing()) activeListDialog.dismiss();
+                activeListDialog = null;
+            }
+        } catch (Throwable t) {
+            logOnce("dismissListDialog failed: " + t);
+            activeListDialog = null;
+        }
+    }
+
+    /** Handle used by rows to re-render the list in place after a state change. */
+    private final class Refresh {
+        void refresh(Activity a) {
+            showFrozenList(a);
+        }
+    }
+
     /** One row in the frozen list: icon + label + package, tappable to unfreeze. */
     private View buildFrozenRow(final Activity activity, final PackageManager pm,
-                                       final String pkg, final LinearLayout parentList) {
+                                       final String pkg, final Refresh refresh) {
         LinearLayout row = new LinearLayout(activity);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
         row.setPadding(dp(activity, 12), dp(activity, 10), dp(activity, 12), dp(activity, 10));
         row.setBackground(rippleBg(0xFFF2F5F7));
+        row.setClickable(true);
+        row.setFocusable(true);
+        // Minimum 48dp touch target for accessibility.
+        row.setMinimumHeight(dp(activity, 56));
 
         android.widget.ImageView icon = new android.widget.ImageView(activity);
         LinearLayout.LayoutParams iconLp = new LinearLayout.LayoutParams(dp(activity, 40),
@@ -1324,26 +1407,65 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
         row.addView(col, new LinearLayout.LayoutParams(0,
                 LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
 
+        String label = safeAppLabel(activity, pm, pkg);
         TextView name = new TextView(activity);
-        name.setText(safeAppLabel(activity, pm, pkg));
+        name.setText(label);
         name.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f);
         name.setTypeface(Typeface.DEFAULT_BOLD);
-        name.setTextColor(0xFF222222);
+        name.setTextColor(0xFF1A1A1A);
         col.addView(name);
 
         TextView sub = new TextView(activity);
         sub.setText(pkg);
         sub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f);
-        sub.setTextColor(0xFF888888);
+        sub.setTextColor(0xFF707070);
         col.addView(sub);
+
+        // Screen readers announce the whole row, not three disconnected fragments.
+        row.setContentDescription(label + "，" + pkg + "，已冻结，点击解冻");
 
         row.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                unfreezeFromList(activity, pm, pkg, parentList);
+                unfreezeFromList(activity, pm, pkg, refresh, (View) v);
             }
         });
         return row;
+    }
+
+    /**
+     * Unfreezes one package and re-renders the list.
+     *
+     * <p>Guards against double-tap: the row is disabled the moment it is handled, so a rapid
+     * second tap cannot fire two {@code setApplicationEnabledSetting} calls (which would leave
+     * the list and the system state disagreeing).
+     */
+    private void unfreezeFromList(final Activity activity, final PackageManager pm,
+                                  final String pkg, final Refresh refresh, final View row) {
+        if (row != null && !row.isEnabled()) return;   // debounce
+        if (row != null) row.setEnabled(false);
+
+        try {
+            pmsSetEnabled(pm, pkg, PackageManager.COMPONENT_ENABLED_STATE_ENABLED);
+
+            int now = safeEnabledState(pm, pkg);
+            if (isFrozen(now)) {
+                if (row != null) row.setEnabled(true);
+                toast(activity, "解冻失败（可能被系统拦截）", Toast.LENGTH_LONG);
+                XposedBridge.log(TAG + ": unfreeze rejected for " + pkg + ", state=" + now);
+                return;
+            }
+            toast(activity, "已解冻 " + safeAppLabel(activity, pm, pkg), Toast.LENGTH_SHORT);
+            XposedBridge.log(TAG + ": unfrozen from list: " + pkg);
+
+            // Re-query and rebuild. The previous dialog is dismissed inside showFrozenList(),
+            // so exactly one list is ever on screen.
+            refresh.refresh(activity);
+        } catch (Throwable t) {
+            if (row != null) row.setEnabled(true);   // allow retry
+            XposedBridge.log(TAG + ": unfreezeFromList failed for " + pkg + ": " + t);
+            toast(activity, "解冻失败：" + t.getMessage(), Toast.LENGTH_LONG);
+        }
     }
 
     private void unfreezeFromList(final Activity activity, final PackageManager pm,
