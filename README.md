@@ -200,7 +200,8 @@ settings-app-freezer/
 ├── version.properties          # 版本号唯一来源（语义化版本）
 ├── CHANGELOG.md                # 版本变更记录
 ├── RELEASE_NOTES.md            # Release 正文
-├── LICENSE                     # GPL-3.0
+├── LICENSE                     # GPL-3.0（原文）
+├── NOTICE.md                   # 第三方组件与构建工具链授权声明
 ├── README.md
 └── .gitignore
 ```
@@ -283,6 +284,8 @@ MAJOR×10000+...      →  AndroidManifest.xml: android:versionCode
 ## 许可证
 
 [GNU General Public License v3.0](LICENSE)
+
+完整的第三方授权声明（Xposed API、各构建工具链许可）见 [NOTICE.md](NOTICE.md)。
 
 模块链接的 Xposed API（`de.robv.android.xposed.*`）由其作者按 Apache License 2.0
 独立分发，使用该接口不影响本项目源码的 GPL-3.0 条款。

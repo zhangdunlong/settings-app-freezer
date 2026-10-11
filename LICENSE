@@ -692,12 +692,3 @@ GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
--------------------------------------------------------------------------------
-
-ADDITIONAL NOTICE (Module API usage)
-
-This project links against the Xposed API (de.robv.android.xposed.*), which is
-distributed separately under the Apache License 2.0 by its respective authors.
-Use of those interfaces is governed by that license and does not alter the terms
-above for this project's own source code.
