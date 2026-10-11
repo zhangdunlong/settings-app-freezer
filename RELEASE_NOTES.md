@@ -57,6 +57,10 @@ com.oplus.settings.feature.homepage.OplusSettingsHomepageActivity   ← 真正�
 并配置独立的重试预算（实测交接目标在数秒后才真正创建）。同时新增
 `tryDirectInjectOnFocus()`：窗口获得焦点时内容已完成测量，直接注入，无需重试。
 
+关键细节：换页过程中壳 Activity 会先停留在设置主页，应用信息内容需数百毫秒后才绘出。
+因此「尚非应用信息页」这一判断**必须允许重试**，否则交接会在第一跳即中止 ——
+这正是该 bug 反复出现的深层原因。
+
 ## 运行要求
 
 - Android 8.0 (API 26) 及以上

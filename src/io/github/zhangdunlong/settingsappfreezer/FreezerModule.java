@@ -1622,23 +1622,34 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
                 XposedBridge.log(TAG + ": handOver: focused window is still the dying host");
                 return;
             }
-            // HARD GATE. The hand-over target is whichever window happens to be focused when the
-            // transient host dies — on ColorOS that is the long-lived settings shell
-            // (OplusSettingsHomepageActivity), which is ALSO what the user sees on the settings
-            // home screen. Injecting here without a content check put the freeze bar on the home
-            // screen, which is exactly the regression this path must not reintroduce.
+            // CONTENT GATE (with retry).
             //
-            // The content check is safe to apply now: by the time the hand-over succeeds the real
-            // app-info page has already rendered (it owns the focus), so "强行停止" is present.
+            // The hand-over target is whichever window is focused when the transient host dies.
+            // On ColorOS that is the long-lived settings shell (OplusSettingsHomepageActivity),
+            // which is ALSO what the user sees on the settings home screen — injecting there
+            // without a content check put the freeze bar on the home screen. That is why the gate
+            // exists.
+            //
+            // IMPORTANT: the gate must NOT end the retry ladder. The shell renders the app-info
+            // page in place, so at the moment the dying host is detected the shell may still be
+            // painting the settings home screen; the force-stop action only appears a few hundred
+            // milliseconds later. Treating "not app-info yet" as final aborted the hand-over and
+            // the button never appeared. Retry instead, and let the gate keep rejecting the page
+            // for as long as it genuinely is not an app-info screen.
             ViewGroup content = resolveContentParent(target);
-            if (content == null) {
-                XposedBridge.log(TAG + ": handOver: target has no content view");
-                return;
-            }
-            if (!looksLikeAppInfoContent(content)) {
-                XposedBridge.log(TAG + ": handOver aborted: focused window "
-                        + target.getClass().getSimpleName()
-                        + " is not an app-info page (no force-stop action)");
+            if (content == null || !looksLikeAppInfoContent(content)) {
+                if (attempt % 5 == 0) {
+                    XposedBridge.log(TAG + ": handOver: focused window "
+                            + target.getClass().getSimpleName()
+                            + " is not an app-info page yet (attempt " + attempt + "/"
+                            + MAX_HANDOVER_ATTEMPTS + "), retrying for " + pkg);
+                }
+                if (attempt < MAX_HANDOVER_ATTEMPTS) {
+                    scheduleDelayedHandOver(dying, pkg, attempt + 1);
+                } else {
+                    XposedBridge.log(TAG + ": handOver: gave up, focused window never became an "
+                            + "app-info page for " + pkg);
+                }
                 return;
             }
             rememberPkg(pkg);
