@@ -102,7 +102,7 @@ echo "== settings-app-freezer v$VERSION_NAME (code $VERSION_CODE) =="
 
 echo "== compile =="
 "$JAVAC" -encoding UTF-8 -source 17 -target 17 -cp "$PLATFORM:$APIJAR" -d "$CLASSES" \
-    "$SRC/src/com/zdl/freezer/FreezerModule.java" 2>&1 \
+    "$SRC/src/io/github/zhangdunlong/settingsappfreezer/FreezerModule.java" 2>&1 \
   || { echo "FATAL: javac failed - aborting before packaging"; exit 1; }
 
 echo "== jar classes =="

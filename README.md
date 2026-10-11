@@ -72,11 +72,35 @@ Titanium Backup 这类外部工具，操作繁琐且容易误伤系统组件。
 adb install -r freezer-module.apk
 ```
 
+> **从旧版升级**：v1.0.0 起 Application ID 由 `com.zdl.freezer` 改为
+> `io.github.zhangdunlong.settingsappfreezer`。若你装过旧包名版本，
+> 请先卸载旧版（`adb uninstall com.zdl.freezer`）再安装，两者互不影响。
+> 已冻结的应用状态按**目标应用包名**记录，与本模块包名无关，不受影响。
+
 ### 2. 在 LSPosed 中启用
 
 1. 打开 **LSPosed Manager → 模块**，勾选 **settings-app-freezer**
-2. 进入模块 → **作用域**，勾选你的设置应用（通常至少包含 `com.android.settings`）
+2. 进入模块 → **作用域**，勾选以下**两项**：
+
+   | 作用域 | 缺失后果 |
+   |---|---|
+   | **系统框架**（`system`） | 模块开机时不注入，任何页面都不会有按钮 |
+   | **设置**（`com.android.settings`） | 模块能加载，但不会 hook 任何设置进程 |
+
+   > ⚠️ **两项都必须勾**。缺任意一项都不会生效，且**没有任何界面提示** ——
+   > 这是本项目最容易踩的坑。
+
 3. **重启手机** —— LSPosed 在开机时把作用域读入内存，仅强停设置进程不生效
+
+### 排查：装好了但没反应
+
+按以下顺序定位（日志命令见文末「反馈」）：
+
+| 日志现象 | 含义 | 处理 |
+|---|---|---|
+| 完全没有 `FreezerModule` 日志 | 作用域未生效 | 检查 `system` 与 `com.android.settings` 两项是否都勾 |
+| 有 hook 日志，无 `button bar injected` | 包名未解析到 | 该机型页面结构未适配，请附日志提 Issue |
+| 有 `handOver aborted: not an app-info page` | 页面内容特征不符 | 确认当前确为应用信息页（页面须含「强行停止」） |
 
 ### 3. 使用
 

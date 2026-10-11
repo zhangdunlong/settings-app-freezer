@@ -9,6 +9,22 @@
 
 ## [Unreleased]
 
+### 变更
+
+**Application ID 变更为 `io.github.zhangdunlong.settingsappfreezer`**
+
+原 `com.zdl.freezer` 不满足 LSPosed 官方模块仓库对反向域名的要求
+（必须是作者**实际拥有**的域名，否则须使用 `io.github.{username}` 前缀）。
+
+- `AndroidManifest.xml` 的 `package` 与 `xposedscope` 同步更新
+- `assets/xposed_init` 入口类全限定名同步更新
+- `FreezerModule.MODULE_PKG` 常量同步更新（自我保护逻辑依赖该常量）
+- 源码目录迁移：`src/com/zdl/freezer/` → `src/io/github/zhangdunlong/settingsappfreezer/`
+- `xposedscope` 新增 `com.miui.securitycenter`（模块已具备 MIUI 应用管理器适配逻辑）
+
+> **升级注意**：包名变更后属于新应用，已安装 `com.zdl.freezer` 的设备需先卸载旧版再安装。
+> 冻结状态由 Android 系统按**目标应用包名**存储，与本模块包名无关，**不受影响**。
+
 ### 修复
 
 **「设置 → 应用 → 应用管理 → 点击应用」详情页不显示冻结按钮**

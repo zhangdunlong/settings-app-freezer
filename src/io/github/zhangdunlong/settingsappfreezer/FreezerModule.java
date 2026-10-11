@@ -1,4 +1,4 @@
-package com.zdl.freezer;
+package io.github.zhangdunlong.settingsappfreezer;
 
 import android.app.Activity;
 import android.content.ComponentName;
@@ -76,7 +76,7 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteInit {
 
     private static final String TAG = "FreezerModule";
-    private static final String MODULE_PKG = "com.zdl.freezer";
+    private static final String MODULE_PKG = "io.github.zhangdunlong.settingsappfreezer";
     private static final int FROZEN_TAG = 0x5f465252; // "FRZR"
     private static final int FROZEN_BAR_TAG = 0x5f465242;  // "FRRB" - the horizontal bar
     private static final int FROZEN_LIST_TAG = 0x5f464c53; // "FRLS" - frozen-list entry button
@@ -110,7 +110,8 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
     // Zygote.specializeAppProcess(), before the main Looper exists, so
     // `new Handler(Looper.getMainLooper())` throws NPE (Looper.mQueue on a null Looper),
     // which aborts <clinit> and makes LSPosed silently drop the whole module with
-    // "Failed to load class com.zdl.freezer.FreezerModule". Resolve it lazily instead.
+    // "Failed to load class io.github.zhangdunlong.settingsappfreezer.FreezerModule".
+    // Resolve it lazily instead.
     private static Handler mainHandler() {
         return new Handler(Looper.getMainLooper());
     }

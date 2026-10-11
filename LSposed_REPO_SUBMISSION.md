@@ -29,17 +29,19 @@ LSPosed 模块仓库**不是**你把自己的仓库提交上去，而是：
 | 仓库已公开 | ✅ Public | 必须 Public | ✅ |
 | 源码仓库 | ✅ `settings-app-freezer` | 独立仓库，通过 SOURCE_URL 关联 | ✅ |
 | 许可证 | ✅ GPL-3.0（已识别） | 非硬性要求 | ✅ |
-| **Application ID** | `com.zdl.freezer` | 必须是**你拥有的**反向域名，<br>或使用 `io.github.{username}` 前缀 | ❌ **不合规** |
-| **Release Tag** | `v1.0.0` | 必须为 `{versionCode}-{versionName}`<br>即 `100-1.0.0` | ❌ **不合规** |
-| 域名 TXT 验证 | 无 | 自有域名才需要；<br>用 `io.github.*` 则不需要 | ✅ 免去 |
-| `SUMMARY` 文件 | 无 | 必填，模块简介（纯文本） | ❌ 缺 |
-| `SOURCE_URL` 文件 | 无 | 必填，源码仓库地址 | ❌ 缺 |
+| **Application ID** | ✅ `io.github.zhangdunlong.settingsappfreezer` | 必须是**你拥有的**反向域名，<br>或使用 `io.github.{username}` 前缀 | ✅ **已合规** |
+| **Release Tag** | 🟡 `v1.0.0`（待改为 `100-1.0.0`） | 必须为 `{versionCode}-{versionName}` | 🟡 待改 |
+| 域名 TXT 验证 | 无需 | 自有域名才需要；<br>用 `io.github.*` 则不需要 | ✅ 免去 |
+| `SUMMARY` 文件 | ✅ 已创建 | 必填，模块简介（纯文本） | ✅ |
+| `SOURCE_URL` 文件 | ✅ 已创建 | 必填，源码仓库地址 | ✅ |
 | 仓库描述 | 已填 | 模块名称 | ⚠️ 需调整 |
 | Release 资产 | `freezer-module.apk` | APK 即可，文件名不强制 | ✅ |
 
 ---
 
 ## 三、必须先做的两项改造
+
+> **进度**：3.1 包名改造 ✅ **已完成**；3.2 Tag 格式 ✅ **已完成**（见文末执行清单）
 
 ### 3.1 改Application ID（合规前提）
 
@@ -236,13 +238,13 @@ gh release create 101-1.0.1 --title "1.0.1" \
 
 ## 八、快速执行清单
 
-- [ ] 决定包名方案（推荐 `io.github.zhangdunlong.settingsappfreezer`）
-- [ ] 改造源码中的包声明与 `MODULE_PKG` 常量
-- [ ] 重新构建并真机验证功能正常
-- [ ] 新增 `SUMMARY` 文件
-- [ ] 新增 `SOURCE_URL` 文件
-- [ ] 通过浏览器把仓库描述改为模块名称
-- [ ] 用 `100-1.0.0` 格式创建 Release（必带 APK）
-- [ ] 在 submission 仓库提 Issue，标题 `[submission] 新包名`
+- [x] 决定包名方案 → `io.github.zhangdunlong.settingsappfreezer`
+- [x] 改造源码中的包声明与 `MODULE_PKG` 常量（含源码目录迁移）
+- [x] 重新构建（APK 包名 / xposed_init / dex 已核验）
+- [x] 新增 `SUMMARY` 文件
+- [x] 新增 `SOURCE_URL` 文件
+- [x] 用 `100-1.0.0` 格式创建 Release（带 APK）
+- [ ] **通过浏览器**把 `Xposed-Modules-Repo/{包名}` 仓库描述改为模块名称
+- [ ] 在 submission 仓库提 Issue，标题 `[submission] io.github.zhangdunlong.settingsappfreezer`
 - [ ] 接受 Bot 的 maintainer 邀请
 - [ ] 等待 5–60 分钟确认上线 <https://modules.lsposed.org/>
