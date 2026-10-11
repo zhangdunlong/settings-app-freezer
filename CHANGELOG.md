@@ -9,7 +9,60 @@
 
 ## [Unreleased]
 
-暂无未发布变更。
+### 修复
+
+**「设置 → 应用 → 应用管理 → 点击应用」详情页不显示冻结按钮**
+
+根因是 ColorOS 的详情页采用**两段式 Activity 交接**：`InstalledAppDetailsTop` 瞬时 Activity
+启动后立即销毁，真正承载页面的是长驻的 `OplusSettingsHomepageActivity`（单 Activity 内换页）。
+原有实现只在 `onCreate` 注入，此时布局尚未测量（`w=0 h=0`），而 120ms 后的第一次重试时
+Activity 已经销毁 —— 重试窗口与页面存活窗口完全错开，按钮因此永远不出现。
+
+- 新增 `handOverToFocusedWindow()`：宿主 Activity 销毁时，把注入动作转交给当前持有焦点的
+  Activity，而不是直接放弃
+- 新增 `scheduleDelayedHandOver()`：交接目标在数秒后才真正创建，故设独立重试预算
+  `MAX_HANDOVER_ATTEMPTS = 60` × `HANDOVER_RETRY_MS = 200ms`（12 秒），
+  不再复用注入重试常量（实测 3 秒不足）
+- 新增 `tryDirectInjectOnFocus()`：窗口获得焦点时内容已完成测量，直接注入，无需重试阶梯；
+  已挂 `onWindowFocusChanged` 与 `onResume`
+- 新增 `findFocusedActivity()` / `readActivities()` / `activityOf()`：
+  Android 9+ 限制 `ActivityThread.getActivities()` 仅返回调用方 PID 的记录，
+  故回退直接反射 `mActivities` 字段
+- 新增 `resolvePkgFromContent()` 级联第2/3 级：调用 `resolveTargetPackage()` 与
+  `extractPkgFromFields()`，使递归解析嵌套 Bundle 的能力在此路径上真正可达
+
+**包名未归一化导致解析失败**
+
+部分 OEM 传递的包名带前导斜杠（MIUI 的 `package_name=//com.android.chrome`），
+旧校验因 `contains("/")` 直接判否，好包名被静默丢弃。
+
+- 新增 `normalizePackage()` / `stripSlashes()` / `looksLikePackageRaw()`
+- 接入**全部 8 处**包名解析点：`resolveTargetPackage`、`findPackageInExtras`、
+  `extractPkgFromFields`、`scanFragmentForPkg`、`describeFragment`、
+  `describeViewForPackage`、`resolvePkgFromContent`、URI 路径分支
+- `findPackageInExtras()` 扩展载体识别：新增 `CharSequence`（SpannedString）分支、
+  `Parcelable` 包裹的 `mBundle` 解包
+
+**设置首页误显示冻结栏（回归）**
+
+交接目标是「当前持有焦点的窗口」，而在 ColorOS 上这恰好也是用户看到的设置首页。
+交接路径必须与探针路径一样受内容特征守卫约束。
+
+- `handOverToFocusedWindow()` 注入前强制 `looksLikeAppInfoContent()` 校验，
+  非应用信息页则放弃交接
+
+**其他**
+
+- `onCreate` 未解析出包名时不再直接返回，改为调度探针，避免页面稍后才可读时彻底放弃
+- `isAppInfoHost()` 接受 `applicationsdetails`（MIUI 应用管理器详情页宿主）
+- 新增一次性深度诊断 `NESTED-EXTRAS`：递归打印 Intent extras 至 6 层、值截断 220 字符，
+  便于直接从日志读出 OEM 实际使用的 key 名
+
+### 部署说明
+
+模块需在 LSPosed 中同时勾选 `com.android.settings` 与 `system` 两个作用域方可生效。
+作用域记录位于 `/data/adb/lspd/config/modules_config.db`（`scope` 表），
+缺少 `com.android.settings` 时模块不会加载任何 Hook，且无任何界面提示。
 
 ---
 

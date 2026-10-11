@@ -87,6 +87,19 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
     /** Extra laid-out retry attempts after the first shot (delays grow adaptively). */
     private static final int MAX_ATTEMPTS = 20;
 
+    /**
+     * Hand-over retry budget.
+     *
+     * <p>Deliberately separate from {@link #MAX_ATTEMPTS}: the hand-over is not waiting for a
+     * layout pass, it is waiting for the SURVIVING Activity to be created at all. Measured on
+     * ColorOS the transient host dies immediately and the real page only appears well after the
+     * whole settings stack has been rebuilt — hundreds of milliseconds later. Reusing the
+     * injection budget (20 x 150ms = 3s) was not always enough and the button silently vanished.
+     * 60 x 200ms = 12s covers the observed worst case with room to spare.
+     */
+    private static final int MAX_HANDOVER_ATTEMPTS = 60;
+    private static final long HANDOVER_RETRY_MS = 200L;
+
     private static final int ACCENT = 0xFF1AA6C4;   // teal, matches the author's theme
     private static final int ACCENT_PRESSED = 0xFF15849B;
     private static final int ACCENT_FROZEN = 0xFF3FBFA8;          // mint = currently frozen
@@ -215,7 +228,11 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
                             + " host=" + isAppInfoHost(cls));
                     final String pkg = resolvePkgForLifecycle(activity);
                     if (pkg == null) {
-                        XposedBridge.log(TAG + ": TRACE   -> no pkg (rejected or unresolvable)");
+                        // Even when the package is still unresolved the page may be an app-info
+                        // screen whose content only becomes readable after layout — keep probing
+                        // instead of giving up, otherwise the button silently never appears.
+                        probeForAppInfoPage(activity, tagCtx + ":onCreate");
+                        XposedBridge.log(TAG + ": TRACE   -> no pkg yet, probe scheduled");
                         return;
                     }
                     if (activity.isFinishing()) {
@@ -255,10 +272,15 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
                         protected void afterHookedMethod(MethodHookParam param) {
                             try {
                                 if (!(param.thisObject instanceof Activity)) return;
-                                Activity activity = (Activity) param.thisObject;
+                                final Activity activity = (Activity) param.thisObject;
+                                if (activity.isFinishing() || activity.isDestroyed()) return;
+                                // onResume is the first callback after the content view exists but
+                                // BEFORE it is necessarily measured, so run the fast path (which
+                                // self-guards on a measured layout) instead of the retry ladder,
+                                // whose first tick may land after this Activity is already gone.
+                                tryDirectInjectOnFocus(activity);
                                 final String pkg = resolvePkgForLifecycle(activity);
                                 if (pkg == null) return;
-                                if (activity.isFinishing() || activity.isDestroyed()) return;
                                 // Skip if we already placed the button on this activity.
                                 ViewGroup content = resolveContentParent(activity);
                                 if (content != null && content.findViewWithTag(FROZEN_TAG) != null) {
@@ -298,6 +320,52 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             } catch (Throwable t4) {
                 XposedBridge.log(TAG + ": FAILED to hook onResume (" + t3 + " / " + t4 + ")");
             }
+        }
+
+        // ---- Page-switch triggers -------------------------------------------------
+        // OPlus-style shells keep ONE Activity alive and swap pages inside it, so onCreate
+        // fires only once for the whole session and onWindowFocusChanged may not fire either.
+        // onPostResume runs after every resume/fragment transaction, which makes it the most
+        // reliable trigger for "the user may be on a new page now".
+        try {
+            XposedHelpers.findAndHookMethod("android.app.Activity", cl, "onPostResume",
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            try {
+                                if (!(param.thisObject instanceof Activity)) return;
+                                probeForAppInfoPage((Activity) param.thisObject, "postResume");
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    });
+            XposedBridge.log(TAG + ": onPostResume hooked");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": FAILED to hook onPostResume: " + t);
+        }
+
+        // A reused singleTask Activity gets a fresh Intent through onNewIntent.
+        try {
+            XposedHelpers.findAndHookMethod("android.app.Activity", cl, "onNewIntent",
+                    Intent.class, new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            try {
+                                if (!(param.thisObject instanceof Activity)) return;
+                                Activity a = (Activity) param.thisObject;
+                                // A new Intent is a strong signal; clear the dedup mark so a
+                                // re-used shell can host a different app's page.
+                                clearBarHost(a);
+                                XposedBridge.log(TAG + ": onNewIntent for " + a.getClass().getName()
+                                        + " intent=" + describeIntent(a));
+                                probeForAppInfoPage(a, "newIntent");
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    });
+            XposedBridge.log(TAG + ": onNewIntent hooked");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": FAILED to hook onNewIntent: " + t);
         }
 
         // onWindowFocusChanged(boolean) — the authoritative "view tree is laid out and
@@ -374,6 +442,12 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
         }
         if (c.contains("installedappdetails") || c.contains("appinfo")
                 || c.contains("appdetails")) {
+            return true;
+        }
+        // MIUI hosts the detail page in its own app-manager activity. It is safe to accept it
+        // because the package is still verified against PackageManager before anything is
+        // injected, and it is rejected again later by looksLikeAppInfoContent().
+        if (c.contains("applicationsdetails")) {
             return true;
         }
         return false;
@@ -501,7 +575,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
 
                         // (a) direct String field, whatever its name — verified against the PM
                         if (v instanceof String) {
-                            String s = (String) v;
+                            String s = normalizePackage((String) v);
                             if (looksLikePackage(s) && pm.getApplicationInfo(s, 0) != null) {
                                 XposedBridge.log(TAG + ": recovered package '" + s
                                         + "' from field " + c.getSimpleName() + "." + f.getName());
@@ -526,7 +600,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
                         if (v instanceof View) {
                             String got = describeViewForPackage((View) v, pm);
                             if (got != null) {
-                                String p = got.replaceAll("^.*(->|=) ", "");
+                                String p = normalizePackage(got.replaceAll("^.*(->|=) ", ""));
                                 XposedBridge.log(TAG + ": recovered package '" + p
                                         + "' from view subtree in field "
                                         + c.getSimpleName() + "." + f.getName());
@@ -543,7 +617,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
                 if (content != null) {
                     String got = describeViewForPackage(content, pm);
                     if (got != null) {
-                        String p = got.replaceAll("^.*(->|=) ", "");
+                        String p = normalizePackage(got.replaceAll("^.*(->|=) ", ""));
                         if (looksLikePackage(p)) {
                             XposedBridge.log(TAG + ": recovered package '" + p
                                     + "' from content view subtree");
@@ -565,16 +639,18 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             if (fr.getArguments() != null) {
                 for (String k : fr.getArguments().keySet()) {
                     Object v = fr.getArguments().get(k);
-                    if (v instanceof String && looksLikePackage((String) v)
-                            && pm.getApplicationInfo((String) v, 0) != null) {
-                        return (String) v;
+                    if (v instanceof String) {
+                        String a = normalizePackage((String) v);
+                        if (looksLikePackage(a) && pm.getApplicationInfo(a, 0) != null) {
+                            return a;
+                        }
                     }
                 }
             }
             if (fr.getView() != null) {
                 String got = describeViewForPackage(fr.getView(), pm);
                 if (got != null) {
-                    String p = got.replaceAll("^.*(->|=) ", "");
+                    String p = normalizePackage(got.replaceAll("^.*(->|=) ", ""));
                     if (looksLikePackage(p)) return p;
                 }
             }
@@ -626,22 +702,283 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             protected void afterHookedMethod(MethodHookParam param) {
                 try {
                     if (!(param.thisObject instanceof Activity)) return;
-                    Activity activity = (Activity) param.thisObject;
+                    final Activity activity = (Activity) param.thisObject;
                     if (!Boolean.TRUE.equals(param.args[0])) return;   // only focus GAINED
                     if (activity.isFinishing() || activity.isDestroyed()) return;
-                    final String pkg = resolvePkgForLifecycle(activity);
-                    if (pkg == null) return;
-                    ViewGroup parent = resolveContentParent(activity);
-                    if (parent != null && parent.findViewWithTag(FROZEN_TAG) != null) return;
-                    XposedBridge.log(TAG + ": windowFocus gained for " + pkg
-                            + " activity=" + activity.getClass().getName()
-                            + " -> injecting now");
-                    injectButton(activity, parent, pkg);
+                    // NOTE: no class-name gate here. OPlus uses a SINGLE-Activity multi-page
+                    // shell (OplusSettingsHomepageActivity) that swaps pages in place, so the
+                    // app-info screen can appear long after onCreate and with no new Intent.
+                    // Class-based gating is done later by looksLikeAppInfoContent().
+                    //
+                    // Window-focus is the ONE signal that is guaranteed to arrive on the surviving
+                    // Activity AFTER its content has been measured — exactly what the transient
+                    // host misses. So try the remembered package first: if this really is an
+                    // app-info page the bar goes in immediately, with no retry ladder involved.
+                    tryDirectInjectOnFocus(activity);
+                    probeForAppInfoPage(activity, "focus");
                 } catch (Throwable t) {
                     XposedBridge.log(TAG + ": focus hook error: " + t);
                 }
             }
         };
+    }
+
+    /**
+     * Fast path used on window-focus gain.
+     *
+     * <p>At that moment the content view is measured, so no retry ladder is needed. This is the
+     * only hook that reliably reaches OEM app-info pages hosted by a transient-then-surviving
+     * Activity pair, because {@code onCreate} fires while the layout is still 0x0 and the host
+     * is destroyed before the first retry can run.
+     *
+     * <p>Safety: the package must still be resolved from this Activity's own Intent/fields or be
+     * a freshly remembered one, and it is verified against PackageManager before injection.
+     */
+    private void tryDirectInjectOnFocus(Activity activity) {
+        try {
+            ViewGroup content = resolveContentParent(activity);
+            if (content == null || content.getWidth() <= 0 || content.getHeight() <= 0) return;
+            if (content.findViewWithTag(FROZEN_TAG) != null) return;   // already there
+            if (isBarAlreadyInWindow(activity, content) || isBarHost(activity)) return;
+
+            String pkg = resolveTargetPackage(activity);
+            if (pkg == null) pkg = extractPkgFromFields(activity);
+            if (pkg == null) {
+                String remembered = lastResolvedPkg;
+                // Only trust the memory on a window whose content is unmistakably app-info.
+                if (remembered != null
+                        && System.currentTimeMillis() - lastResolvedAt <= PKG_MEMORY_MS * 5
+                        && looksLikeAppInfoContent(content)
+                        && activity.getPackageManager().getApplicationInfo(remembered, 0) != null) {
+                    pkg = remembered;
+                    XposedBridge.log(TAG + ": focus fast-path using remembered " + pkg);
+                }
+            }
+            if (pkg == null) return;
+            // Content gate for the remembered/fallback case only; a package parsed straight from
+            // this Activity's own Intent is trustworthy enough on its own.
+            if (pkg.equals(lastResolvedPkg) && !looksLikeAppInfoContent(content)) {
+                XposedBridge.log(TAG + ": focus fast-path skipped, content is not app-info for " + pkg);
+                return;
+            }
+            rememberPkg(pkg);
+            resolveTargetUser(activity, pkg);
+            XposedBridge.log(TAG + ": focus fast-path injecting for " + pkg
+                    + " into " + activity.getClass().getSimpleName());
+            if (!injectOrListen(activity, pkg)) {
+                probeForAppInfoPage(activity, "fastpath");
+            }
+        } catch (Throwable t) {
+            logOnce("tryDirectInjectOnFocus failed: " + t);
+        }
+    }
+
+    /**
+     * Page-switch probe.
+     *
+     * <p>Needed because the app-info page is not always a separate Activity: OPlus (and other
+     * OEM shells) host many settings pages inside one long-lived Activity and swap the content
+     * in place. Neither {@code onCreate} (fires once) nor {@code ViewRootImpl.performTraversals}
+     * (not reached for that window) fires when the user navigates from the settings home screen
+     * into the app list and then into an app's detail page.
+     *
+     * <p>Strategy: whenever this probe runs, look at what is actually on screen. If the visible
+     * content is unmistakably an app-info page (the "强行停止 / Force stop" action is always
+     * present there), resolve the package from the content and inject.
+     */
+    private void probeForAppInfoPage(final Activity activity, String trigger) {
+        try {
+            if (activity.isFinishing() || activity.isDestroyed()) return;
+            ViewGroup decor = resolveContentParent(activity);
+            if (decor == null || decor.getWidth() <= 0 || decor.getHeight() <= 0) {
+                // Not measured yet — try again shortly.
+                scheduleProbe(activity, trigger + "+retry", 2);
+                return;
+            }
+            if (decor.findViewWithTag(FROZEN_TAG) != null) return;   // already injected
+            if (isBarHost(activity)) return;
+
+            if (!looksLikeAppInfoContent(decor)) {
+                scheduleProbe(activity, trigger + "+watch", 2);
+                return;
+            }
+
+            XposedBridge.log(TAG + ": PROBE(" + trigger + ") app-info content detected in "
+                    + activity.getClass().getName());
+            final String pkg = resolvePkgFromContent(activity, decor);
+            if (pkg == null) {
+                XposedBridge.log(TAG + ": PROBE content looks like app-info but package unresolved");
+                return;
+            }
+            rememberPkg(pkg);
+            resolveTargetUser(activity, pkg);
+            injectButton(activity, decor, pkg);
+        } catch (Throwable t) {
+            logOnce("probeForAppInfoPage failed: " + t);
+        }
+    }
+
+    /** Re-runs the probe a few times, because the page may still be swapping in. */
+    private void scheduleProbe(final Activity activity, String trigger, final int remaining) {
+        if (remaining <= 0) return;
+        try {
+            mainHandler().postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        if (activity.isFinishing() || activity.isDestroyed()) return;
+                        ViewGroup decor = resolveContentParent(activity);
+                        if (decor == null || decor.getWidth() <= 0) return;
+                        if (decor.findViewWithTag(FROZEN_TAG) != null) return;
+                        if (isBarHost(activity)) return;
+                        if (!looksLikeAppInfoContent(decor)) {
+                            if (remaining > 1) scheduleProbe(activity, trigger, remaining - 1);
+                            return;
+                        }
+                        XposedBridge.log(TAG + ": PROBE(" + trigger + ") app-info content detected in "
+                                + activity.getClass().getName());
+                        String pkg = resolvePkgFromContent(activity, decor);
+                        if (pkg == null) return;
+                        rememberPkg(pkg);
+                        resolveTargetUser(activity, pkg);
+                        injectButton(activity, decor, pkg);
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }, 220L);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * Extracts the target package by walking the visible content of an app-info page.
+     *
+     * <p>Used for OEM shells that render the detail page without putting the package in the
+     * Intent. The package is recovered from the app icon's content description / tag, or from
+     * any text that looks like an installed package and is verified via PackageManager.
+     */
+    private static String resolvePkgFromContent(Activity activity, View decor) {
+        try {
+            PackageManager pm = activity.getPackageManager();
+            String fromView = describeViewForPackage(decor, pm);
+            if (fromView != null) {
+                String p = normalizePackage(fromView.replaceAll("^.*(->|=) ", ""));
+                if (looksLikePackage(p) && pm.getApplicationInfo(p, 0) != null) return p;
+            }
+        } catch (Throwable ignored) {
+        }
+        // 2) The shell Intent. This MUST run here too: the only reliable carrier on ColorOS is the
+        //    nested ":settings:show_fragment_args" Bundle, and the Intent-based resolver is gated
+        //    away by isAppInfoHost() on the lifecycle path (SubSettings is hard-rejected there).
+        //    The caller has already verified the content is an app-info page, so resolving from
+        //    the Intent here is safe.
+        try {
+            String fromIntent = resolveTargetPackage(activity);
+            if (fromIntent != null) {
+                XposedBridge.log(TAG + ": PROBE resolved package from Intent = " + fromIntent);
+                return fromIntent;
+            }
+        } catch (Throwable t) {
+            logOnce("PROBE intent resolution error: " + t);
+        }
+        // 3) Private Activity fields (mPackageName / mAppPackageName / mPackage).
+        try {
+            String fromFields = extractPkgFromFields(activity);
+            if (fromFields != null) {
+                XposedBridge.log(TAG + ": PROBE resolved package from Activity fields = " + fromFields);
+                return fromFields;
+            }
+        } catch (Throwable ignored) {
+        }
+        // 4) The remembered package is a good fallback here: this probe only fires when the screen
+        //    really is an app-info page, and the shell reuses activities without new Intents.
+        try {
+            String remembered = lastResolvedPkg;
+            if (remembered != null
+                    && System.currentTimeMillis() - lastResolvedAt <= PKG_MEMORY_MS * 5
+                    && activity.getPackageManager().getApplicationInfo(remembered, 0) != null) {
+                XposedBridge.log(TAG + ": PROBE using remembered package " + remembered);
+                return remembered;
+            }
+        } catch (Throwable ignored) {
+        }
+        // Nothing worked: dump the nested Bundle structure once, so the real key name can be
+        // read straight off the log instead of guessed.
+        dumpNestedExtras(activity);
+        return null;
+    }
+
+    /** One-shot deep dump of the Activity Intent extras, recursing into nested Bundles. */
+    private static void dumpNestedExtras(final Activity activity) {
+        try {
+            String key = activity.getClass().getName() + "@" + System.identityHashCode(activity);
+            if (!DUMPED.add("nested:" + key)) return;
+            XposedBridge.log(TAG + ": NESTED-EXTRAS " + describeIntentExtrasDeep(activity.getIntent(), 0));
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static String describeIntentExtrasDeep(Intent intent, int depth) {
+        StringBuilder sb = new StringBuilder();
+        if (intent == null) return "intent=null";
+        sb.append("action=").append(intent.getAction());
+        android.os.Bundle b;
+        try {
+            b = intent.getExtras();
+        } catch (Throwable t) {
+            return sb.append(" extras=<err ").append(t).append('>').toString();
+        }
+        if (b == null || b.isEmpty()) return sb.append(" extras{}").toString();
+        sb.append('\n');
+        sb.append(describeBundleDeep(b, 1));
+        return sb.toString();
+    }
+
+    private static String describeBundleDeep(android.os.Bundle b, int indent) {
+        StringBuilder sb = new StringBuilder();
+        if (b == null) return "";
+        if (indent > 6) return "...<too deep>\n";
+        String pad = repeat("    ", indent);
+        List<String> keys;
+        try {
+            keys = new ArrayList<>(b.keySet());
+        } catch (Throwable t) {
+            return pad + "<keySet err " + t + ">\n";
+        }
+        java.util.Collections.sort(keys);
+        for (String k : keys) {
+            Object v;
+            try {
+                v = b.get(k);
+            } catch (Throwable t) {
+                sb.append(pad).append(k).append(" = <err ").append(t).append(">\n");
+                continue;
+            }
+            if (v instanceof android.os.Bundle) {
+                sb.append(pad).append(k).append(" = Bundle{\n");
+                sb.append(describeBundleDeep((android.os.Bundle) v, indent + 1));
+                sb.append(pad).append("}\n");
+            } else if (v == null) {
+                sb.append(pad).append(k).append(" = null\n");
+            } else {
+                String vs;
+                try {
+                    vs = String.valueOf(v);
+                } catch (Throwable t) {
+                    vs = "<toString err>";
+                }
+                if (vs.length() > 220) vs = vs.substring(0, 220) + "…";
+                sb.append(pad).append(k).append(" = ")
+                  .append(v.getClass().getName()).append(" -> ").append(vs).append('\n');
+            }
+        }
+        return sb.toString();
+    }
+
+    private static String repeat(String s, int n) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < n && i < 16; i++) sb.append(s);
+        return sb.toString();
     }
 
     /**
@@ -683,7 +1020,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
                     if (v == null) continue;
                     String s;
                     if (v instanceof String) {
-                        s = (String) v;
+                        s = normalizePackage((String) v);
                         if (!looksLikePackage(s)) continue;
                     } else if (v instanceof android.app.Fragment) {
                         android.app.Fragment fr = (android.app.Fragment) v;
@@ -718,9 +1055,11 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             if (fr.getArguments() != null) {
                 for (String k : fr.getArguments().keySet()) {
                     Object v = fr.getArguments().get(k);
-                    if (v instanceof String && looksLikePackage((String) v)
-                            && pm.getApplicationInfo((String) v, 0) != null) {
-                        return "FRAGMENT " + cls + " arg[" + k + "]=" + v;
+                    if (v instanceof String) {
+                        String a = normalizePackage((String) v);
+                        if (looksLikePackage(a) && pm.getApplicationInfo(a, 0) != null) {
+                            return "FRAGMENT " + cls + " arg[" + k + "]=" + a;
+                        }
                     }
                 }
             }
@@ -735,15 +1074,19 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
     private static String describeViewForPackage(View v, PackageManager pm) {
         try {
             Object tag = v.getTag();
-            if (tag instanceof String && looksLikePackage((String) tag)
-                    && pm.getApplicationInfo((String) tag, 0) != null) {
-                return "VIEW tag=" + tag;
+            if (tag instanceof String) {
+                String g = normalizePackage((String) tag);
+                if (looksLikePackage(g) && pm.getApplicationInfo(g, 0) != null) {
+                    return "VIEW tag=" + g;
+                }
             }
             if (v instanceof android.widget.TextView) {
                 CharSequence t2 = ((android.widget.TextView) v).getText();
-                if (t2 != null && looksLikePackage(t2.toString())
-                        && pm.getApplicationInfo(t2.toString(), 0) != null) {
-                    return "VIEW text=" + t2;
+                if (t2 != null) {
+                    String g = normalizePackage(t2.toString());
+                    if (looksLikePackage(g) && pm.getApplicationInfo(g, 0) != null) {
+                        return "VIEW text=" + g;
+                    }
                 }
             }
             if (v instanceof android.view.ViewGroup) {
@@ -857,6 +1200,93 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
         return null;
     }
 
+    /**
+     * Recursively searches a Bundle (and any nested Bundle / Parcelable inside it) for a value
+     * that is a syntactically valid package AND is actually installed.
+     *
+     * <p>The hard verification is what makes this safe: a settings Intent carries plenty of
+     * unrelated strings (titles, fragment class names, metric tags), so anything found here is
+     * confirmed with {@code getApplicationInfo} before it is accepted.
+     */
+    private static String findPackageInExtras(android.os.Bundle b, PackageManager pm, int depth) {
+        if (b == null || depth > 4) return null;
+        try {
+            for (String key : b.keySet()) {
+                Object v;
+                try {
+                    v = b.get(key);
+                } catch (Throwable t) {
+                    continue;
+                }
+                if (v == null) continue;
+
+                if (v instanceof String) {
+                    String s = normalizePackage(((String) v));
+                    if (looksLikePackage(s) && isInstalled(pm, s)) {
+                        XposedBridge.log(TAG + ": package found in extras key '" + key
+                                + "' (depth " + depth + ") = " + s);
+                        return s;
+                    }
+                } else if (v instanceof CharSequence) {
+                    // Some shells store the package as a SpannedString.
+                    try {
+                        String s = normalizePackage(v.toString());
+                        if (looksLikePackage(s) && isInstalled(pm, s)) {
+                            XposedBridge.log(TAG + ": package found in extras key '" + key
+                                    + "' (depth " + depth + ") = " + s);
+                            return s;
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                } else if (v instanceof android.os.Bundle) {
+                    String got = findPackageInExtras((android.os.Bundle) v, pm, depth + 1);
+                    if (got != null) return got;
+                } else if (v instanceof android.os.Parcelable) {
+                    // A Bundle that arrives wrapped (e.g. FragmentArgs) still carries the package.
+                    try {
+                        android.os.Parcelable p = (android.os.Parcelable) v;
+                        java.lang.reflect.Field f = p.getClass().getDeclaredField("mBundle");
+                        f.setAccessible(true);
+                        Object inner = f.get(p);
+                        if (inner instanceof android.os.Bundle) {
+                            String got = findPackageInExtras((android.os.Bundle) inner, pm, depth + 1);
+                            if (got != null) return got;
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                } else if (v instanceof java.util.List) {
+                    try {
+                        java.util.List list = (java.util.List) v;
+                        for (int i = 0; i < list.size() && i < 50; i++) {
+                            Object o = list.get(i);
+                            if (o instanceof String) {
+                                String s = normalizePackage((String) o);
+                                if (looksLikePackage(s) && isInstalled(pm, s)) {
+                                    return s;
+                                }
+                            }
+                            if (o instanceof android.os.Bundle) {
+                                String got = findPackageInExtras((android.os.Bundle) o, pm, depth + 1);
+                                if (got != null) return got;
+                            }
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    private static boolean isInstalled(PackageManager pm, String pkg) {
+        try {
+            return pm.getApplicationInfo(pkg, 0) != null;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
     /** Compact, log-safe description of an Activity's Intent (action / data / extras keys). */
     private static String describeIntent(Activity a) {
         try {
@@ -939,13 +1369,24 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
                 pkg = data.getSchemeSpecificPart();
             }
             if (isNull(pkg)) {
-                String seg = data.getLastPathSegment();
+                String seg = normalizePackage(data.getLastPathSegment());
                 if (looksLikePackage(seg)) pkg = seg;
             }
-            if (isNull(pkg) && looksLikePackage(data.getPath())) {
-                String path = data.getPath();
-                pkg = path.startsWith("/") ? path.substring(1) : path;
+            if (isNull(pkg)) {
+                // NOTE: do not gate on looksLikePackage(data.getPath()) first — "//com.x.y"
+                // contains slashes and would fail the raw check before normalisation runs.
+                pkg = normalizePackage(data.getPath());
+                if (!looksLikePackage(pkg)) pkg = null;
             }
+        }
+        if (isNull(pkg)) {
+            // OEM shells (ColorOS/OPlus) pass the target package inside a NESTED fragment-args
+            // Bundle, e.g.
+            //   extras{ :settings:show_fragment     = com.android.settings.applications.appinfo…
+            //            :settings:show_fragment_args = Bundle{package_name=com.xx.yy, …} }
+            // The inner key name varies per OEM and per fragment, so recurse through every
+            // Bundle and keep the first value that is a verified installed package.
+            pkg = findPackageInExtras(intent.getExtras(), activity.getPackageManager(), 0);
         }
         if (isNull(pkg)) pkg = intent.getStringExtra(Intent.EXTRA_PACKAGE_NAME);
         if (isNull(pkg)) {
@@ -967,6 +1408,11 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
         }
 
         if (isNull(pkg) || !looksLikePackage(pkg)) return null;
+        // Normalise BEFORE the identity checks: shells hand over "//com.x.y", "/com.x.y" and
+        // "package:com.x.y", all of which would otherwise fail the getApplicationInfo() lookup
+        // below and be silently discarded.
+        pkg = normalizePackage(pkg);
+        if (pkg == null || !looksLikePackage(pkg)) return null;
         if (MODULE_PKG.equals(pkg)) return null;
 
         // Hard verification: the candidate must be an installed package, otherwise this
@@ -987,10 +1433,68 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
     }
 
     private static boolean looksLikePackage(String s) {
-        if (s == null) return false;
-        String t = s.trim();
+        String t = normalizePackage(s);
+        if (t == null) return false;
         if (t.length() < 3 || t.length() > 255) return false;
-        if (t.contains("/") || t.contains(" ")) return false;
+        if (t.indexOf(' ') >= 0) return false;
+        int dot = t.indexOf('.');
+        return dot > 0 && dot < t.length() - 1;
+    }
+
+    /**
+     * Normalises a raw package candidate.
+     *
+     * <p>OEM shells hand the package over in several mangled forms, all of which used to defeat
+     * {@link #looksLikePackage}:
+     * <ul>
+     *   <li>{@code //com.android.chrome}   — MIUI puts a slash in the {@code package_name} extra</li>
+     *   <li>{@code /com.android.chrome}    — leftover path separator</li>
+     *   <li>{@code package:com.x.y}        — a URI prefix</li>
+     *   <li>{@code  com.x.y \n}            — stray whitespace</li>
+     * </ul>
+     * Every candidate — whether it came from an extra, a URI or a private field — is passed
+     * through here before validation, so a leading slash can no longer silently reject a
+     * perfectly good package.
+     *
+     * @return the cleaned package, or {@code null} if nothing usable is left
+     */
+    private static String normalizePackage(String raw) {
+        if (raw == null) return null;
+        String t = raw.trim();
+        if (t.isEmpty()) return null;
+        // Strip any scheme/URI prefix: package:com.x.y, content://…, etc.
+        int colon = t.lastIndexOf(':');
+        if (colon >= 0 && colon < t.length() - 1) {
+            String after = t.substring(colon + 1).trim();
+            // Only accept the suffix when it actually looks like a package, otherwise a colon
+            // inside a genuine package name would be mangled.
+            String cand = stripSlashes(after);
+            if (looksLikePackageRaw(cand)) return cand;
+        }
+        return stripSlashes(t);
+    }
+
+    /** Removes leading/trailing slashes and whitespace; {@code //a.b} becomes {@code a.b}. */
+    private static String stripSlashes(String s) {
+        int start = 0;
+        int end = s.length();
+        while (start < end && (s.charAt(start) == '/' || s.charAt(start) == '\\'
+                || s.charAt(start) == ' ' || s.charAt(start) == '\t'
+                || s.charAt(start) == '\n' || s.charAt(start) == '\r')) {
+            start++;
+        }
+        while (end > start && (s.charAt(end - 1) == '/' || s.charAt(end - 1) == '\\'
+                || s.charAt(end - 1) == ' ' || s.charAt(end - 1) == '\t'
+                || s.charAt(end - 1) == '\n' || s.charAt(end - 1) == '\r')) {
+            end--;
+        }
+        return start >= end ? null : s.substring(start, end);
+    }
+
+    /** Package-shape check without re-entering {@link #normalizePackage}. */
+    private static boolean looksLikePackageRaw(String t) {
+        if (t == null) return false;
+        if (t.length() < 3 || t.length() > 255) return false;
         int dot = t.indexOf('.');
         return dot > 0 && dot < t.length() - 1;
     }
@@ -1013,8 +1517,13 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             public void run() {
                 try {
                     if (activity.isFinishing() || activity.isDestroyed()) {
-                        XposedBridge.log(TAG + ": activity gone before inject attempt "
-                                + attempt + " for " + pkg);
+                        // The transient host (e.g. InstalledAppDetailsTop) is dying while the
+                        // REAL app-info activity is already on top. Retrying here is pointless —
+                        // hand the work to the focused window, otherwise the retry window closes
+                        // before the content is laid out and the button silently never appears.
+                        XposedBridge.log(TAG + ": host " + activity.getClass().getSimpleName()
+                                + " is finishing, handing over to focused window for " + pkg);
+                        handOverToFocusedWindow(activity, pkg, attempt);
                         return;
                     }
                     XposedBridge.log(TAG + ": inject attempt " + attempt + " for " + pkg
@@ -1026,11 +1535,16 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
                     if (attempt + 1 < MAX_ATTEMPTS) {
                         scheduleInject(activity, pkg, attempt + 1);
                     } else {
+                        handOverToFocusedWindow(activity, pkg, attempt);
                         XposedBridge.log(TAG + ": GAVE UP injecting button for " + pkg
                                 + " after " + MAX_ATTEMPTS + " attempts");
                     }
                 } catch (Throwable t) {
                     XposedBridge.log(TAG + ": inject task error for " + pkg + ": " + t);
+                    try {
+                        handOverToFocusedWindow(activity, pkg, attempt);
+                    } catch (Throwable ignored) {
+                    }
                 }
             }
         };
@@ -1047,6 +1561,213 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             }
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": scheduleInject failed for " + pkg + ": " + t);
+        }
+    }
+
+    /**
+     * Delayed re-try of {@link #handOverToFocusedWindow}.
+     *
+     * <p>Timing on the two-Activity app-info handoff: the transient host dies, the whole settings
+     * stack is momentarily empty, and the surviving page is created a fraction of a second later.
+     * A single synchronous look-up therefore always finds nothing.
+     */
+    private void scheduleDelayedHandOver(final Activity dying, final String pkg, final int attempt) {
+        try {
+            mainHandler().postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        handOverToFocusedWindow(dying, pkg, attempt);
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }, HANDOVER_RETRY_MS);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * Re-targets the injection at whichever Activity currently owns the focused window.
+     *
+     * <p>Needed because OEM shells implement the app-info screen as a two-Activity handoff:
+     * a transient host (e.g. AOSP/ColorOS {@code InstalledAppDetailsTop}) starts, immediately
+     * finishes, and the surviving page lives in a different Activity that was never handed a
+     * usable lifecycle callback. Without this transfer the retry ladder dies with the transient
+     * host and the button is never injected.
+     */
+    private void handOverToFocusedWindow(final Activity dying, final String pkg, int attempt) {
+        try {
+            if (pkg == null || MODULE_PKG.equals(pkg)) return;
+            Activity target = findFocusedActivity(dying);
+            if (target == null) {
+                // The transient host is destroyed BEFORE the real page is laid out, so the target
+                // genuinely does not exist yet. Do not give up: the surviving Activity will get a
+                // window-focus callback a moment later, and its own hook runs the fast path.
+                // Retry a few times so the hand-over works even when focus never re-fires.
+                if (attempt < MAX_HANDOVER_ATTEMPTS) {
+                    if (attempt % 10 == 0) {
+                        XposedBridge.log(TAG + ": handOver: still waiting for the surviving page "
+                                + "(attempt " + attempt + "/" + MAX_HANDOVER_ATTEMPTS + ") for " + pkg);
+                    }
+                    scheduleDelayedHandOver(dying, pkg, attempt + 1);
+                } else {
+                    XposedBridge.log(TAG + ": handOver: giving up after " + MAX_HANDOVER_ATTEMPTS
+                            + " attempts (~" + (MAX_HANDOVER_ATTEMPTS * HANDOVER_RETRY_MS / 1000)
+                            + "s) for " + pkg);
+                }
+                return;
+            }
+            if (target == dying) {
+                XposedBridge.log(TAG + ": handOver: focused window is still the dying host");
+                return;
+            }
+            // HARD GATE. The hand-over target is whichever window happens to be focused when the
+            // transient host dies — on ColorOS that is the long-lived settings shell
+            // (OplusSettingsHomepageActivity), which is ALSO what the user sees on the settings
+            // home screen. Injecting here without a content check put the freeze bar on the home
+            // screen, which is exactly the regression this path must not reintroduce.
+            //
+            // The content check is safe to apply now: by the time the hand-over succeeds the real
+            // app-info page has already rendered (it owns the focus), so "强行停止" is present.
+            ViewGroup content = resolveContentParent(target);
+            if (content == null) {
+                XposedBridge.log(TAG + ": handOver: target has no content view");
+                return;
+            }
+            if (!looksLikeAppInfoContent(content)) {
+                XposedBridge.log(TAG + ": handOver aborted: focused window "
+                        + target.getClass().getSimpleName()
+                        + " is not an app-info page (no force-stop action)");
+                return;
+            }
+            rememberPkg(pkg);
+            resolveTargetUser(target, pkg);
+            XposedBridge.log(TAG + ": handOver to " + target.getClass().getName()
+                    + " (attempt " + attempt + ") for " + pkg
+                    + " laidOut=" + (content.getWidth() > 0 && content.getHeight() > 0));
+            if (injectOrListen(target, pkg)) {
+                XposedBridge.log(TAG + ": handOver inject succeeded for " + pkg);
+            } else {
+                probeForAppInfoPage(target, "handover");
+            }
+        } catch (Throwable t) {
+            logOnce("handOverToFocusedWindow failed for " + pkg + ": " + t);
+        }
+    }
+
+    /**
+     * Best-effort lookup of the Activity that currently owns the focused window.
+     *
+     * <p>Uses the public {@code ActivityThread} → {@code ActivityClient} chain reflectively; it
+     * is intentionally best-effort because every link may be absent or renamed on OEM builds.
+     */
+    private static Activity findFocusedActivity(Activity exclude) {
+        try {
+            Class<?> at = Class.forName("android.app.ActivityThread");
+            Object app = at.getMethod("currentActivityThread").invoke(null);
+            if (app == null) return null;
+
+            // Android 9+ restricts ActivityThread.getActivities() to the caller PID. When the app
+            // manager renders the detail page in a separate process, that method returns null, so
+            // fall back to the mActivities field and filter by process id ourselves.
+            Object[] activities = readActivities(at, app);
+
+            java.lang.reflect.Method isFocused = null;
+            try {
+                isFocused = Class.forName("android.app.Activity").getMethod("hasWindowFocus");
+            } catch (Throwable ignored) {
+            }
+            if (isFocused != null) {
+                for (Object rec : activities) {
+                    Activity a = activityOf(rec);
+                    if (a == null || a == exclude) continue;
+                    try {
+                        Object foc = isFocused.invoke(a);
+                        if (foc instanceof Boolean && (Boolean) foc) return a;
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+            // Prefer the resumed activity, then the most recently started one.
+            Activity fallback = null;
+            for (int i = activities.length - 1; i >= 0; i--) {
+                Activity a = activityOf(activities[i]);
+                if (a == null || a == exclude) continue;
+                try {
+                    if (a.isFinishing() || a.isDestroyed()) continue;
+                    if (fallback == null) fallback = a;
+                    java.lang.reflect.Method isRes = null;
+                    try {
+                        isRes = Class.forName("android.app.Activity")
+                                .getMethod("isResumed");
+                    } catch (Throwable ignored) {
+                    }
+                    if (isRes != null && (Boolean) isRes.invoke(a)) return a;
+                } catch (Throwable ignored) {
+                }
+            }
+            return fallback;
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    /** Reads the live Activity records of THIS process, bypassing the API-level restriction. */
+    private static Object[] readActivities(Class<?> activityThread, Object app) {
+        // Preferred: the public accessor, which works on our own process.
+        try {
+            Object[] a = (Object[]) activityThread.getMethod("getActivities").invoke(app);
+            if (a != null) return a;
+        } catch (Throwable ignored) {
+        }
+        // Fallback: walk mActivities (ArrayMap<IBinder, ActivityClientRecord>).
+        try {
+            java.lang.reflect.Field f = null;
+            Class<?> c = activityThread;
+            while (c != null && f == null) {
+                try {
+                    f = c.getDeclaredField("mActivities");
+                } catch (NoSuchFieldException ignored) {
+                    c = c.getSuperclass();
+                }
+            }
+            if (f == null) return new Object[0];
+            f.setAccessible(true);
+            Object map = f.get(app);
+            if (map == null) return new Object[0];
+
+            java.util.List<Object> out = new java.util.ArrayList<>();
+            if (map instanceof java.util.Map) {
+                for (Object v : ((java.util.Map<?, ?>) map).values()) {
+                    if (v != null) out.add(v);
+                }
+            } else {
+                // android.util.ArrayMap: values() via reflection
+                java.lang.reflect.Method values = map.getClass().getMethod("values");
+                Object coll = values.invoke(map);
+                if (coll instanceof Iterable) {
+                    for (Object v : (Iterable<?>) coll) {
+                        if (v != null) out.add(v);
+                    }
+                }
+            }
+            return out.toArray(new Object[0]);
+        } catch (Throwable ignored) {
+            return new Object[0];
+        }
+    }
+
+    /** Extracts the Activity from an ActivityClientRecord (or returns it if it IS an Activity). */
+    private static Activity activityOf(Object record) {
+        if (record == null) return null;
+        if (record instanceof Activity) return (Activity) record;
+        try {
+            java.lang.reflect.Field f = record.getClass().getDeclaredField("activity");
+            f.setAccessible(true);
+            Object a = f.get(record);
+            return (a instanceof Activity) ? (Activity) a : null;
+        } catch (Throwable ignored) {
+            return null;
         }
     }
 
