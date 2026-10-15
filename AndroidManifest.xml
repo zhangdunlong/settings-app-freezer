@@ -15,7 +15,7 @@
             android:value="82" />
         <meta-data
             android:name="xposeddescription"
-            android:value="在系统设置的应用信息页注入「冻结/解冻」按钮，停用任意用户应用以达到冻结效果。针对 ColorOS / RealmeUI / 现代 Android 重写，无需依赖厂商内部类。" />
+            android:value="在系统设置的应用信息页注入「冻结 / 解冻」按钮，停用任意用户应用。针对 ColorOS / RealmeUI / 现代 Android 重写，不依赖厂商内部类。 · Injects freeze/unfreeze buttons into the Settings app-info page. Rewritten for ColorOS / RealmeUI and modern Android without relying on vendor-internal classes." />
         <meta-data
             android:name="xposedscope"
             android:value="com.android.settings:com.coloros.settings:com.oppo.settings:com.oplus.settings:com.realme.settings:com.oneplus.settings:com.miui.securitycenter" />
