@@ -12,7 +12,66 @@ LSPosed 官方模块仓库要求 Release 标签格式为 `{versionCode}-{version
 
 ## [Unreleased]
 
-暂无未发布变更。
+### 修复
+
+**冻结分身应用时误冻结原版（严重）**
+
+公开的 `PackageManager.setApplicationEnabledSetting` 重载是
+`(String packageName, int newState, int flags)` —— **第三个参数是 flags，不是 userId**。
+原实现把它当作用户 id 传入：
+
+```java
+pm.setApplicationEnabledSetting(pkg, state, cloneUserId);   // 错
+```
+
+该调用能正常编译，用户 id 被静默塞进 flags 槽位，实际仍作用于**调用方所在用户（0）**。
+后果是最坏的一种：点击「冻结分身」时，模块报告分身操作失败，
+而**原版应用被真的冻结了**。
+
+实测证据（OnePlus PJZ110 / Android 16 / ColorOS，微信分身 user 999）：
+
+| 用户 | 操作前 | 操作后（修复前） | 操作后（修复后） |
+|---|---|---|---|
+| 0（原版） | `enabled=1` | **`enabled=3`（被误冻结）** | `enabled=1` |
+| 998 | `enabled=1` | `enabled=1` | `enabled=1` |
+| 999（目标分身） | `enabled=1` | `enabled=1`（未冻上） | **`enabled=3`** |
+
+读取路径同样失效：公开 API 没有 `getApplicationEnabledSetting(String, int)`，
+原反射调用抛 `NoSuchMethodException`，导致状态回读恒为 DEFAULT(0)，
+界面无法反映分身的真实冻结状态。
+
+修复方式：新增 `pmForUser(Context, int)`，通过
+`Context.createPackageContextAsUser(pkg, 0, UserHandle.of(userId))` 取得**绑定到目标用户**
+的 `PackageManager`，之后读写都用普通的公开 API —— 用户由 Context 决定，不靠额外参数。
+
+- `pmForUser()`：用户域 PackageManager 工厂。非 0 用户且无法创建时**返回 null**，
+  绝不回退到调用方作用域的实例
+- `pmsSetEnabled()`：改为接收 `Context`；拿不到用户域实例时**抛异常拒绝执行**，
+  而不是写入错误的用户（宁可失败，不可改错）
+- `enabledStateForUser()`：改用用户域实例的公开读取；无法创建时返回 DEFAULT，
+  避免把原版状态当成分身状态显示
+- `safeEnabledState()` / `readEnabledState()` / `readEnabledStateFor()` 全部改为
+  以页面 Context 为准
+- `undoFreeze()` 修正为使用 `targetUserFor(activity)`（原为 `currentProcessUser()`，
+  在分身页面会指回原版）
+
+**真机验证（修复后，全链路）**
+
+| 验证项 | 结果 |
+|---|---|
+| 分身识别 | `target user for com.tencent.mm = 999 (extra:userId)` |
+| 分身页按钮前缀 | 显示 `[分身] 冻结此应用` |
+| 分身状态读取 | 正常（不再抛 NoSuchMethodException） |
+| 冻结分身 | 999 → `enabled=3`；0 与 998 **保持不变** |
+| 回读校验 | `已冻结 微信 want=FREEZE readback=3` |
+| 解冻分身 | 999 → `enabled=1`；`已解冻 微信 want=ENABLE readback=1` |
+| 原版页面 | 无 `[分身]` 前缀，状态正确 |
+| 原版冻结/解冻 | 0 → `enabled=3` → `enabled=1`，分身旁支不受影响 |
+| 原版应用可启动 | 正常 |
+
+> **升级建议**：使用过分身冻结功能的用户，请检查原版对应应用是否被误冻结
+> （系统设置 → 应用 → 已停用应用，或本模块的「❄ 已冻结 N」列表），
+> 必要时手动解冻。
 
 ---
 

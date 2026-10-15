@@ -1916,7 +1916,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             }
 
             final PackageManager pm = activity.getPackageManager();
-            int state = safeEnabledState(pm, pkg);
+            int state = safeEnabledState(activity, pm, pkg);
             final boolean frozen = isFrozen(state);
 
             // Horizontal bar: [ freeze/unfreeze ] [ frozen-apps list ]
@@ -2110,7 +2110,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
                 if (ai == null || ai.packageName == null) continue;
                 if (ai.packageName.equals(MODULE_PKG)) continue;
                 try {
-                    if (enabledStateForUser(pm, ai.packageName, user)
+                    if (enabledStateForUser(ctx, pm, ai.packageName, user)
                             == PackageManager.COMPONENT_ENABLED_STATE_DISABLED_USER) {
                         // Sort key = the moment we froze it. Packages frozen before this
                         // session (or by other means) have no record and sink to the bottom,
@@ -2347,10 +2347,10 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
     /** Re-freezes a package from the undo affordance. */
     private void undoFreeze(final Activity activity, final String pkg, final String label) {
         try {
-            pmsSetEnabled(activity.getPackageManager(), pkg,
+            pmsSetEnabled(activity, pkg,
                     PackageManager.COMPONENT_ENABLED_STATE_DISABLED_USER,
-                    currentProcessUser());
-            int st = safeEnabledState(activity.getPackageManager(), pkg);
+                    targetUserFor(activity));
+            int st = safeEnabledState(activity, activity.getPackageManager(), pkg);
             if (isFrozen(st)) {
                 invalidateFrozenCount();
                 markFrozenAt(pkg);
@@ -2441,10 +2441,10 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
         if (row != null) row.setEnabled(false);
 
         try {
-            pmsSetEnabled(pm, pkg, PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
+            pmsSetEnabled(activity, pkg, PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
                     targetUserFor(activity));
 
-            int now = safeEnabledState(pm, pkg);
+            int now = safeEnabledState(activity, pm, pkg);
             if (isFrozen(now)) {
                 if (row != null) row.setEnabled(true);
                 toast(activity, "解冻失败（可能被系统拦截）", Toast.LENGTH_LONG);
@@ -2517,7 +2517,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
                     ? PackageManager.COMPONENT_ENABLED_STATE_DISABLED_USER
                     : PackageManager.COMPONENT_ENABLED_STATE_ENABLED;
 
-            pmsSetEnabled(pm, pkg, next, targetUserFor(activity));
+            pmsSetEnabled(activity, pkg, next, targetUserFor(activity));
 
             // Read-back is the ONLY source of truth: setApplicationEnabledSetting() can silently
             // no-op when the caller lacks the signature permission, so we must verify the actual
@@ -2702,41 +2702,86 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
     }
 
     /**
-     * Reads the enabled state for a specific user.
+     * Returns a {@link PackageManager} bound to {@code userId}, or {@code null} if one cannot be
+     * created.
      *
-     * <p>{@code getApplicationEnabledSetting} always reads the owner user, so for clone users we
-     * must go through the user-aware {@code IPackageManager} path instead.
+     * <p>WHY THIS EXISTS — the clone-freeze bug:
+     *
+     * <p>The public {@code PackageManager} read/write APIs take <b>no user argument</b>. They
+     * always act on the user that owns the {@code Context} behind the manager. The public
+     * {@code setApplicationEnabledSetting} overload is
+     * {@code (String packageName, int newState, int flags)} — so the "obvious" cross-user call
+     *
+     * <pre>  pm.setApplicationEnabledSetting(pkg, state, cloneUserId)   // WRONG</pre>
+     *
+     * compiles cleanly, silently passes the user id in the <b>flags</b> slot, and still targets
+     * the caller's user. The result is the worst possible outcome: the tap reports a failure on
+     * the clone while the <b>owner's</b> copy of the app is disabled.
+     *
+     * <p>There is also no public {@code getApplicationEnabledSetting(String, int)}; the
+     * user-aware reader lives on {@code IPackageManager}, whose signature drifts between
+     * releases. Creating a per-user {@code Context} is the stable route: its manager resolves the
+     * user internally, so the plain public APIs then do the right thing.
+     *
+     * <p>Returns {@code null} — never a caller-scoped fallback — when {@code userId} is non-zero
+     * and the context cannot be created, so callers are forced to abort instead of writing to the
+     * wrong user.
      */
-    private static int enabledStateForUser(PackageManager pm, String pkg, int userId) {
-        if (userId == 0) {
+    private static PackageManager pmForUser(Context ctx, int userId) {
+        if (ctx == null) return null;
+        if (userId == 0 || userId == currentProcessUser()) {
             try {
-                return pm.getApplicationEnabledSetting(pkg);
+                return ctx.getPackageManager();
             } catch (Throwable t) {
-                return PackageManager.COMPONENT_ENABLED_STATE_DEFAULT;
+                return null;
             }
         }
         try {
-            // Compile-time-free reflective call: keeps the 2-arg hidden API off the
-            // verification path on Android 16 while still reading the clone's real state.
-            java.lang.reflect.Method m = PackageManager.class.getMethod(
-                    "getApplicationEnabledSetting", String.class, int.class);
-            Object v = m.invoke(pm, pkg, userId);
-            if (v instanceof Integer) return (Integer) v;
+            Class<?> uhClass = Class.forName("android.os.UserHandle");
+            Object uh = uhClass.getMethod("of", int.class).invoke(null, userId);
+            java.lang.reflect.Method m = Context.class.getMethod(
+                    "createPackageContextAsUser", String.class, int.class, uhClass);
+            Context userCtx = (Context) m.invoke(ctx, ctx.getPackageName(), 0, uh);
+            if (userCtx != null) {
+                PackageManager userPm = userCtx.getPackageManager();
+                if (userPm != null) return userPm;
+            }
         } catch (Throwable t) {
-            logOnce("enabledStateForUser(" + userId + ") via reflection failed: " + t);
+            logOnce("pmForUser(" + userId + ") failed: " + t);
         }
-        // Fallback: assume default so the UI still renders and the user can retry.
-        return PackageManager.COMPONENT_ENABLED_STATE_DEFAULT;
+        return null;
+    }
+
+    /**
+     * Reads the enabled state of {@code pkg} for a specific user.
+     *
+     * <p>Uses a user-scoped {@link PackageManager} so the plain public reader returns that user's
+     * state; see {@link #pmForUser} for why the user must come from the context.
+     */
+    private static int enabledStateForUser(Context ctx, PackageManager fallbackPm,
+                                           String pkg, int userId) {
+        PackageManager pm = pmForUser(ctx, userId);
+        if (pm == null && userId == 0) pm = fallbackPm;     // owner user: any manager will do
+        if (pm == null) {
+            // Non-owner user without a user-scoped manager: report DEFAULT rather than the
+            // owner's state, which would make the button lie about the clone.
+            return PackageManager.COMPONENT_ENABLED_STATE_DEFAULT;
+        }
+        try {
+            return pm.getApplicationEnabledSetting(pkg);
+        } catch (Throwable t) {
+            return PackageManager.COMPONENT_ENABLED_STATE_DEFAULT;
+        }
     }
 
     /** User-aware replacement for the old state reader. */
-    private int readEnabledState(PackageManager pm, String pkg) {
-        return enabledStateForUser(pm, pkg, currentProcessUser());
+    private int readEnabledState(Context ctx, PackageManager pm, String pkg) {
+        return enabledStateForUser(ctx, pm, pkg, currentProcessUser());
     }
 
     /** User-aware read bound to a specific page (clone-aware). */
     private int readEnabledStateFor(Activity a, PackageManager pm, String pkg) {
-        return enabledStateForUser(pm, pkg, targetUserFor(a));
+        return enabledStateForUser(a, pm, pkg, targetUserFor(a));
     }
 
     /**
@@ -2746,23 +2791,22 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
      * <p>{@code userId} is what makes clone-scoped freezing possible — passing 0 (the previous
      * hard-coded value) would always target the owner's copy.
      */
-    private void pmsSetEnabled(PackageManager pm, String pkg, int state, int userId) {
-        try {
-            pm.setApplicationEnabledSetting(pkg, state, userId);
-        } catch (NoSuchMethodError | AbstractMethodError err) {
-            XposedBridge.log(TAG + ": direct setApplicationEnabledSetting missing, using reflection");
-            try {
-                java.lang.reflect.Method m = PackageManager.class.getMethod(
-                        "setApplicationEnabledSetting", String.class, int.class, int.class);
-                m.invoke(pm, pkg, state, userId);
-            } catch (Throwable t) {
-                throw new RuntimeException(t);
-            }
+    private void pmsSetEnabled(Context ctx, String pkg, int state, int userId) {
+        PackageManager pm = pmForUser(ctx, userId);
+        if (pm == null) {
+            // Refuse to continue. Falling back to the caller-scoped manager here is what made
+            // "freeze the clone" disable the OWNER's app; a hard failure is always better than
+            // mutating the wrong user.
+            throw new IllegalStateException(
+                    "no PackageManager for user " + userId + "; refusing to freeze " + pkg);
         }
+        // Third argument is FLAGS (not a user id) — the user comes from the context behind
+        // `pm`, which pmForUser() has already bound to `userId`.
+        pm.setApplicationEnabledSetting(pkg, state, 0);
     }
 
-    private int safeEnabledState(PackageManager pm, String pkg) {
-        return readEnabledState(pm, pkg);
+    private int safeEnabledState(Context ctx, PackageManager pm, String pkg) {
+        return readEnabledState(ctx, pm, pkg);
     }
 
 
@@ -2833,7 +2877,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
     private void showDiagnostics(Activity activity, String pkg) {
         try {
             PackageManager pm = activity.getPackageManager();
-            int s = safeEnabledState(pm, pkg);
+            int s = safeEnabledState(activity, pm, pkg);
             ApplicationInfo ai = pm.getApplicationInfo(pkg, 0);
             StringBuilder sb = new StringBuilder();
             sb.append(pkg).append("\n");
