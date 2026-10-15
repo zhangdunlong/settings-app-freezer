@@ -26,6 +26,23 @@ fi
 : "${VERSION_NAME:=1.0.0}"
 : "${VERSION_CODE:=100}"
 
+# AndroidManifest.xml carries the version that actually lands in the APK (aapt2 link is not
+# given --version-code/--version-name), while version.properties is the documented single source
+# of truth. Nothing else keeps the two in sync, so a silent drift ships an APK whose version
+# disagrees with the repo. Fail the build instead.
+_MANIFEST="$SRC/AndroidManifest.xml"
+if [ -f "$_MANIFEST" ]; then
+  _M_CODE="$(grep -oE 'android:versionCode="[^"]*"' "$_MANIFEST" | head -1 | grep -oE '[0-9]+')"
+  _M_NAME="$(grep -oE 'android:versionName="[^"]*"' "$_MANIFEST" | head -1 | sed 's/.*="//; s/"$//')"
+  if [ "$_M_CODE" != "$VERSION_CODE" ] || [ "$_M_NAME" != "$VERSION_NAME" ]; then
+    echo "FATAL: version mismatch between version.properties and AndroidManifest.xml"
+    echo "       version.properties : code=$VERSION_CODE name=$VERSION_NAME"
+    echo "       AndroidManifest.xml: code=$_M_CODE name=$_M_NAME"
+    exit 1
+  fi
+  echo "version OK: $VERSION_NAME ($VERSION_CODE)"
+fi
+
 # ---- Toolchain resolution ---------------------------------------------------
 # Expected layout (override with env vars if yours differs):
 #   <root>/jdk/                      JDK 17

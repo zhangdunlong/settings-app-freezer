@@ -12,6 +12,14 @@ LSPosed 官方模块仓库要求 Release 标签格式为 `{versionCode}-{version
 
 ## [Unreleased]
 
+暂无未发布变更。
+
+---
+
+## [1.0.1] — 2026-10-15
+
+> **强烈建议升级**：本版修复了一个会**误冻结原版应用**的严重缺陷。
+
 ### 修复
 
 **冻结分身应用时误冻结原版（严重）**
@@ -264,4 +272,5 @@ ColorOS 的详情页是**两段式 Activity 交接**：`InstalledAppDetailsTop` 
   （属于系统行为，与模块无关）；正常用户操作路径不受影响
 - 锁屏状态下通知面板会占据窗口焦点，自动化验证前需先解锁
 
+[1.0.1]: https://github.com/zhangdunlong/settings-app-freezer/releases/tag/101-1.0.1
 [1.0.0]: https://github.com/zhangdunlong/settings-app-freezer/releases/tag/100-1.0.0
