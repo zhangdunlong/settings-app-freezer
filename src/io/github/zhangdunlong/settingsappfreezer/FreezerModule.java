@@ -1972,6 +1972,9 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             btn.setGravity(Gravity.CENTER);
             btn.setSingleLine(false);
             btn.setMaxLines(2);
+            // 57% + 40% + the 10dp gap stays inside the window; the Chinese pair needs 55.6%
+            // and 39.0%, so this leaves the current Chinese layout visually unchanged.
+            capPillWidth(activity, btn, 0.57f);
             btn.setIncludeFontPadding(false);
             btn.setPadding(dp(activity, 22), dp(activity, 12),
                     dp(activity, 22), dp(activity, 12));
@@ -2056,6 +2059,28 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
     }
 
     /** Builds the "frozen apps" entry button; the label is filled by {@link #refreshListBadge}. */
+    /**
+     * Caps a pill's width so the two-button bar can never grow past the window.
+     *
+     * <p>Both pills are {@code WRAP_CONTENT} inside a horizontally centred LinearLayout, so a
+     * long label simply widens the bar until it exceeds the window — and the window then centres
+     * it and clips BOTH ends. Measured on a 1440px-wide device: the Chinese pair occupies
+     * 1402px (97.4%), while the English pair occupies exactly 1440px (100%) with zero margin —
+     * one longer word, or a larger accessibility font scale, away from being cut off.
+     *
+     * <p>The cap is a fraction of the screen rather than a fixed dp so it holds across display
+     * sizes and font scales. Labels are allowed to WRAP onto a second line (the maxLines settings
+     * below) instead of being ellipsized, so the text stays complete and full-size.
+     */
+    private static void capPillWidth(Activity activity, TextView v, float fraction) {
+        try {
+            int screen = activity.getResources().getDisplayMetrics().widthPixels;
+            int max = (int) (screen * fraction);
+            if (max > 0) v.setMaxWidth(max);
+        } catch (Throwable ignored) {
+        }
+    }
+
     private static TextView buildListButton(Activity activity) {
         TextView t = new TextView(activity);
         t.setTag(FROZEN_LIST_TAG);
@@ -2063,9 +2088,19 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
         t.setTypeface(Typeface.DEFAULT_BOLD);
         t.setTextColor(Color.WHITE);
         t.setGravity(Gravity.CENTER);
+        // singleLine, NOT multi-line: a multi-line TextView measures against the full AT_MOST
+        // width, so it stretches to its maxWidth even when the text is short — the badge
+        // "❄ Frozen 0" ballooned from 258px to its 576px cap that way. The badge text is a short
+        // fixed pattern, so one line plus the width cap is both tidier and bounded.
         t.setSingleLine(true);
         t.setIncludeFontPadding(false);
         t.setPadding(dp(activity, 18), dp(activity, 12), dp(activity, 18), dp(activity, 12));
+        // Deliberately NO maxWidth here. Capping the badge does bound the pair, but the cap is
+        // applied during LinearLayout's SECOND measure pass (triggered when the freeze pill wraps
+        // onto two lines) with an EXACTLY spec — so "❄ Frozen 0" rendered 576px wide instead of
+        // its natural 258px, leaving a mostly-empty pill. The badge text is a short fixed pattern
+        // ("❄ <word> N"), so leaving it at its natural width keeps the layout tidy while the
+        // freeze pill's cap still bounds the pair in every realistic case.
         t.setElevation(dp(activity, 10));
         t.setBackground(solidWith(LIST_BADGE));
         t.setContentDescription(tr("查看已冻结应用列表", "View frozen apps"));
@@ -2863,7 +2898,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
 
     /** @return human-readable reason if the package must not be frozen, else null. */
     private String criticalReason(Activity activity, PackageManager pm, String pkg) {
-        if (CRITICAL_PKGS.contains(pkg)) return tr("系统关键包 ", "Critical system package ") + pkg;
+        if (CRITICAL_PKGS.contains(pkg)) return tr("系统关键包 ", "critical system package ") + pkg;
 
         // Current launcher(s) — freezing the launcher would leave the user with no home.
         try {
@@ -2872,7 +2907,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             List<ResolveInfo> ris = pm.queryIntentActivities(home, 0);
             for (ResolveInfo ri : ris) {
                 if (ri.activityInfo != null && pkg.equals(ri.activityInfo.packageName)) {
-                    return tr("桌面启动器", "current launcher");
+                    return tr("当前桌面启动器", "current launcher");
                 }
             }
         } catch (Throwable ignored) {
@@ -2887,7 +2922,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
                 if (list != null) {
                     for (android.view.inputmethod.InputMethodInfo info : list) {
                         if (info != null && pkg.equals(info.getPackageName())) {
-                            return tr("当前输入法", "active input method");
+                            return tr("当前输入法", "current input method");
                         }
                     }
                 }
@@ -2966,13 +3001,13 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
         // In a clone user the label is prefixed so the user can never mistake the clone's
         // button for the owner app's one.
         String label = frozen
-                    ? tr("❄ 已冻结 · 点此解冻", "❄ Frozen · tap to unfreeze")
-                    : tr("❄ 冻结此应用", "❄ Freeze this app");
+                    ? tr("❄ 已冻结 · 点此解冻", "❄ Unfreeze")
+                    : tr("❄ 冻结此应用", "❄ Freeze");
         if (targetUserFor((Activity) (btn.getContext() instanceof Activity
                 ? btn.getContext() : null)) != 0) {
             label = frozen
-                        ? tr("[分身] 已冻结 · 点此解冻", "[Clone] ❄ Frozen · tap to unfreeze")
-                        : tr("[分身] 冻结此应用", "[Clone] ❄ Freeze this app");
+                        ? tr("[分身] 已冻结 · 点此解冻", "[Clone] Unfreeze")
+                        : tr("[分身] 冻结此应用", "[Clone] Freeze");
         }
         btn.setText(label);
         applyPill(btn, frozen);
