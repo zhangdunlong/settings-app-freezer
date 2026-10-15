@@ -33,6 +33,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
@@ -460,6 +461,39 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
      * "强行停止 / Force stop" action, so the presence of that button in the visible tree is a
      * reliable signal.
      */
+    // ------------------------------------------------------------------
+    // Localization
+    // ------------------------------------------------------------------
+    //
+    // The build pipeline links the manifest only — there is no aapt2 resource compilation and no
+    // generated R class — so localized strings cannot live in res/values-*. They are resolved in
+    // Java against the host process locale instead.
+    //
+    // Locale.getDefault() is the process-wide default, which Android sets from the app's own
+    // configuration. On Android 13+ that means a per-app language choice (Settings set to English
+    // while the system runs Chinese) still resolves correctly here, matching the page the user is
+    // actually looking at.
+    //
+    // Strings that MATCH the system UI (the force-stop label used to recognise an app-info page)
+    // are deliberately NOT translated — they must keep every spelling we might encounter.
+    // See containsForceStopLabel().
+
+    /** True when the host locale is Chinese; the module's source strings are Chinese. */
+    private static boolean isChinese() {
+        try {
+            Locale l = Locale.getDefault();
+            if (l == null) return true;
+            return "zh".equalsIgnoreCase(l.getLanguage());
+        } catch (Throwable t) {
+            return true;   // source language — never leave the UI blank
+        }
+    }
+
+    /** Picks the localized variant of a UI string. */
+    private static String tr(String zh, String en) {
+        return isChinese() ? zh : en;
+    }
+
     private static boolean looksLikeAppInfoContent(View decor) {
         try {
             return containsForceStopLabel(decor, 0);
@@ -1975,7 +2009,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             lp.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
             lp.bottomMargin = dp(activity, 150); // clear of the gesture nav bar
             bar.setLayoutParams(lp);
-            bar.setContentDescription("冻结操作栏");
+            bar.setContentDescription(tr("冻结操作栏", "Freeze action bar"));
 
             final String target = pkg;
             btn.setOnClickListener(new View.OnClickListener() {
@@ -2034,7 +2068,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
         t.setPadding(dp(activity, 18), dp(activity, 12), dp(activity, 18), dp(activity, 12));
         t.setElevation(dp(activity, 10));
         t.setBackground(solidWith(LIST_BADGE));
-        t.setContentDescription("查看已冻结应用列表");
+        t.setContentDescription(tr("查看已冻结应用列表", "View frozen apps"));
         return t;
     }
 
@@ -2071,14 +2105,17 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
     private static void refreshListBadge(TextView listBtn) {
         try {
             int n = frozenCountFor(listBtn.getContext());
-            listBtn.setText(n > 0 ? ("❄ 已冻结 " + n) : "❄ 已冻结 0");
+            listBtn.setText(n > 0
+                    ? (tr("❄ 已冻结 ", "❄ Frozen ") + n)
+                    : tr("❄ 已冻结 0", "❄ Frozen 0"));
             listBtn.setAlpha(n > 0 ? 1f : 0.6f);
             // Never rely on colour alone — the label text already carries the state, and this
             // description makes the badge distinguishable for screen readers next to the
             // primary freeze button.
-            listBtn.setContentDescription("查看已冻结应用列表，当前 " + n + " 个");
+            listBtn.setContentDescription(tr("查看已冻结应用列表，当前 " + n + " 个",
+                    "View frozen apps, " + n + " frozen"));
         } catch (Throwable t) {
-            listBtn.setText("❄ 已冻结");
+            listBtn.setText(tr("❄ 已冻结", "❄ Frozen"));
         }
     }
 
@@ -2199,7 +2236,8 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
 
             final TextView header = new TextView(activity);
             header.setTag(HEADER_TAG);
-            header.setText("已冻结应用（" + frozen.size() + "）");
+            header.setText(tr("已冻结应用（" + frozen.size() + "）",
+                    "Frozen apps (" + frozen.size() + ")"));
             header.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f);
             header.setTypeface(Typeface.DEFAULT_BOLD);
             header.setTextColor(0xFF5A5A5A);
@@ -2207,7 +2245,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             list.addView(header);
 
             final TextView hint = new TextView(activity);
-            hint.setText("点击任意一行即可解冻");
+            hint.setText(tr("点击任意一行即可解冻", "Tap any row to unfreeze"));
             hint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f);
             hint.setTextColor(0xFF707070);
             hint.setPadding(dp(activity, 12), dp(activity, 0), dp(activity, 12), dp(activity, 8));
@@ -2223,7 +2261,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
 
             android.app.AlertDialog dialog = new android.app.AlertDialog.Builder(activity)
                     .setView(scroll)
-                    .setPositiveButton("关闭", null)
+                    .setPositiveButton(tr("关闭", "Close"), null)
                     .create();
             dialog.setCanceledOnTouchOutside(true);
             activeListDialog = dialog;
@@ -2240,7 +2278,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             XposedBridge.log(TAG + ": frozen list shown, " + frozen.size() + " entries");
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": showFrozenList failed: " + t);
-            toast(activity, "打开列表失败：" + t.getMessage(), Toast.LENGTH_LONG);
+            toast(activity, tr("打开列表失败：", "Could not open the list: ") + t.getMessage(), Toast.LENGTH_LONG);
         }
     }
 
@@ -2276,7 +2314,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             box.addView(icon);
 
             TextView title = new TextView(activity);
-            title.setText("暂无已冻结应用");
+            title.setText(tr("暂无已冻结应用", "No frozen apps"));
             title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f);
             title.setTypeface(Typeface.DEFAULT_BOLD);
             title.setTextColor(0xFF1A1A1A);
@@ -2285,7 +2323,8 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             box.addView(title);
 
             TextView sub = new TextView(activity);
-            sub.setText("在应用信息页点击「冻结此应用」\n被冻结的应用会出现在这里");
+            sub.setText(tr("在应用信息页点击「冻结此应用」\n被冻结的应用会出现在这里",
+                    "Tap \u201CFreeze this app\u201D on an app-info page\nFrozen apps will show up here"));
             sub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f);
             sub.setTextColor(0xFF707070);
             sub.setGravity(Gravity.CENTER);
@@ -2295,7 +2334,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
 
             android.app.AlertDialog dialog = new android.app.AlertDialog.Builder(activity)
                     .setView(box)
-                    .setPositiveButton("知道了", null)
+                    .setPositiveButton(tr("知道了", "Got it"), null)
                     .create();
             dialog.setCanceledOnTouchOutside(true);
             activeListDialog = dialog;
@@ -2309,7 +2348,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             XposedBridge.log(TAG + ": empty state shown");
         } catch (Throwable t) {
             logOnce("showEmptyState failed: " + t);
-            toast(activity, "当前没有已冻结的应用", Toast.LENGTH_SHORT);
+            toast(activity, tr("当前没有已冻结的应用", "No frozen apps yet"), Toast.LENGTH_SHORT);
         }
     }
 
@@ -2321,7 +2360,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
     private void toastWithUndo(final Activity activity, final String pkg, final String label) {
         try {
             final android.widget.Toast t = android.widget.Toast.makeText(
-                    activity, "已解冻 " + label + "　撤销", Toast.LENGTH_LONG);
+                    activity, tr("已解冻 " + label + "　撤销", "Unfrozen " + label + "  Undo"), Toast.LENGTH_LONG);
             // Toast#setAction is a hidden API; reach it reflectively and degrade gracefully
             // to a plain toast (with an "撤销" hint) when the ROM does not expose it.
             try {
@@ -2332,7 +2371,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
                     public void onClick(View v) {
                         undoFreeze(activity, pkg, label);
                     }
-                }, "撤销");
+                }, tr("撤销", "Undo"));
             } catch (Throwable hidden) {
                 XposedBridge.log(TAG + ": Toast.setAction unavailable (" + hidden
                         + "), falling back to plain toast");
@@ -2340,7 +2379,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             t.show();
         } catch (Throwable t) {
             logOnce("toastWithUndo failed: " + t);
-            toast(activity, "已解冻 " + label, Toast.LENGTH_SHORT);
+            toast(activity, tr("已解冻 " + label, "Unfrozen " + label), Toast.LENGTH_SHORT);
         }
     }
 
@@ -2354,15 +2393,16 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             if (isFrozen(st)) {
                 invalidateFrozenCount();
                 markFrozenAt(pkg);
-                toast(activity, "已恢复冻结 " + label, Toast.LENGTH_SHORT);
+                toast(activity, tr("已恢复冻结 " + label, "Re-frozen " + label), Toast.LENGTH_SHORT);
                 showFrozenList(activity);
             } else {
-                toast(activity, "撤销失败，系统拒绝了停用请求", Toast.LENGTH_LONG);
+                toast(activity, tr("撤销失败，系统拒绝了停用请求",
+                    "Undo failed: the system rejected the disable request"), Toast.LENGTH_LONG);
             }
             XposedBridge.log(TAG + ": undo freeze for " + pkg + " -> " + st);
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": undo failed for " + pkg + ": " + t);
-            toast(activity, "撤销失败", Toast.LENGTH_LONG);
+            toast(activity, tr("撤销失败", "Undo failed"), Toast.LENGTH_LONG);
         }
     }
 
@@ -2417,7 +2457,8 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
         col.addView(sub);
 
         // Screen readers announce the whole row, not three disconnected fragments.
-        row.setContentDescription(label + "，" + pkg + "，已冻结，点击解冻");
+        row.setContentDescription(tr(label + "，" + pkg + "，已冻结，点击解冻",
+                    label + ", " + pkg + ", frozen, tap to unfreeze"));
 
         row.setOnClickListener(new View.OnClickListener() {
             @Override
@@ -2447,7 +2488,8 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             int now = safeEnabledState(activity, pm, pkg);
             if (isFrozen(now)) {
                 if (row != null) row.setEnabled(true);
-                toast(activity, "解冻失败（可能被系统拦截）", Toast.LENGTH_LONG);
+                toast(activity, tr("解冻失败（可能被系统拦截）",
+                        "Unfreeze failed (blocked by the system)"), Toast.LENGTH_LONG);
                 XposedBridge.log(TAG + ": unfreeze rejected for " + pkg + ", state=" + now);
                 return;
             }
@@ -2462,7 +2504,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
         } catch (Throwable t) {
             if (row != null) row.setEnabled(true);   // allow retry
             XposedBridge.log(TAG + ": unfreezeFromList failed for " + pkg + ": " + t);
-            toast(activity, "解冻失败：" + t.getMessage(), Toast.LENGTH_LONG);
+            toast(activity, tr("解冻失败：", "Unfreeze failed: ") + t.getMessage(), Toast.LENGTH_LONG);
         }
     }
 
@@ -2505,7 +2547,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
 
             String block = criticalReason(activity, pm, pkg);
             if (block != null) {
-                toast(activity, "已阻止冻结：" + block, Toast.LENGTH_LONG);
+                toast(activity, tr("已阻止冻结：", "Freeze blocked: ") + block, Toast.LENGTH_LONG);
                 XposedBridge.log(TAG + ": blocked freeze of " + pkg + " (" + block + ")");
                 return;
             }
@@ -2531,16 +2573,21 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             updateLabel(btn, newState, pkg);
             refreshSiblingListBadge(btn);
             String msg = ok
-                    ? (wantFreeze ? "已冻结 " + labelOf(pm, pkg) : "已解冻 " + labelOf(pm, pkg))
-                    : "操作未生效（可能被系统/安全软件拦截）";
+                    ? (wantFreeze
+                            ? tr("已冻结 ", "Frozen ") + labelOf(pm, pkg)
+                            : tr("已解冻 ", "Unfrozen ") + labelOf(pm, pkg))
+                    : tr("操作未生效（可能被系统/安全软件拦截）",
+                            "No effect (blocked by the system or a security app)");
             toast(activity, msg, ok ? Toast.LENGTH_SHORT : Toast.LENGTH_LONG);
             XposedBridge.log(TAG + ": " + msg + " want=" + (wantFreeze ? "FREEZE" : "ENABLE")
                     + " readback=" + newState);
         } catch (SecurityException se) {
-            toast(activity, "无权限停用该应用（需系统签名权限）", Toast.LENGTH_LONG);
+            toast(activity, tr("无权限停用该应用（需系统签名权限）",
+                        "Not permitted to disable this app (needs system signature permission)"),
+                    Toast.LENGTH_LONG);
             XposedBridge.log(TAG + ": SecurityException for " + pkg + ": " + se);
         } catch (Throwable t) {
-            toast(activity, "操作失败：" + t.getMessage(), Toast.LENGTH_LONG);
+            toast(activity, tr("操作失败：", "Operation failed: ") + t.getMessage(), Toast.LENGTH_LONG);
             XposedBridge.log(TAG + ": toggle failed for " + pkg + ": " + t);
         }
     }
@@ -2816,7 +2863,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
 
     /** @return human-readable reason if the package must not be frozen, else null. */
     private String criticalReason(Activity activity, PackageManager pm, String pkg) {
-        if (CRITICAL_PKGS.contains(pkg)) return "系统关键包 " + pkg;
+        if (CRITICAL_PKGS.contains(pkg)) return tr("系统关键包 ", "Critical system package ") + pkg;
 
         // Current launcher(s) — freezing the launcher would leave the user with no home.
         try {
@@ -2825,7 +2872,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             List<ResolveInfo> ris = pm.queryIntentActivities(home, 0);
             for (ResolveInfo ri : ris) {
                 if (ri.activityInfo != null && pkg.equals(ri.activityInfo.packageName)) {
-                    return "桌面启动器";
+                    return tr("桌面启动器", "current launcher");
                 }
             }
         } catch (Throwable ignored) {
@@ -2840,7 +2887,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
                 if (list != null) {
                     for (android.view.inputmethod.InputMethodInfo info : list) {
                         if (info != null && pkg.equals(info.getPackageName())) {
-                            return "当前输入法";
+                            return tr("当前输入法", "active input method");
                         }
                     }
                 }
@@ -2864,7 +2911,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
                                 && p.importance
                                 == android.app.ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND
                                 && pkg.equals(p.processName)) {
-                            return "前台运行中";
+                            return tr("前台运行中", "running in the foreground");
                         }
                     }
                 }
@@ -2881,14 +2928,16 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             ApplicationInfo ai = pm.getApplicationInfo(pkg, 0);
             StringBuilder sb = new StringBuilder();
             sb.append(pkg).append("\n");
-            sb.append("状态: ").append(stateToName(s)).append("\n");
-            sb.append("系统应用: ").append((ai.flags & ApplicationInfo.FLAG_SYSTEM) != 0).append("\n");
+            sb.append(tr("状态: ", "State: ")).append(stateToName(s)).append("\n");
+            sb.append(tr("系统应用: ", "System app: "))
+                    .append((ai.flags & ApplicationInfo.FLAG_SYSTEM) != 0).append("\n");
             String block = criticalReason(activity, pm, pkg);
-            sb.append("保护: ").append(block == null ? "无（可冻结）" : block);
+            sb.append(tr("保护: ", "Protection: "))
+                    .append(block == null ? tr("无（可冻结）", "none (freezable)") : block);
             XposedBridge.log(TAG + ": DIAG\n" + sb);
             toast(activity, sb.toString(), Toast.LENGTH_LONG);
         } catch (Throwable t) {
-            toast(activity, "诊断失败：" + t.getMessage(), Toast.LENGTH_LONG);
+            toast(activity, tr("诊断失败：", "Diagnostics failed: ") + t.getMessage(), Toast.LENGTH_LONG);
         }
     }
 
@@ -2916,10 +2965,14 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
         // Text carries the state, so the UI never depends on colour alone (WCAG 1.4.1).
         // In a clone user the label is prefixed so the user can never mistake the clone's
         // button for the owner app's one.
-        String label = frozen ? "❄ 已冻结 · 点此解冻" : "❄ 冻结此应用";
+        String label = frozen
+                    ? tr("❄ 已冻结 · 点此解冻", "❄ Frozen · tap to unfreeze")
+                    : tr("❄ 冻结此应用", "❄ Freeze this app");
         if (targetUserFor((Activity) (btn.getContext() instanceof Activity
                 ? btn.getContext() : null)) != 0) {
-            label = frozen ? "[分身] 已冻结 · 点此解冻" : "[分身] 冻结此应用";
+            label = frozen
+                        ? tr("[分身] 已冻结 · 点此解冻", "[Clone] ❄ Frozen · tap to unfreeze")
+                        : tr("[分身] 冻结此应用", "[Clone] ❄ Freeze this app");
         }
         btn.setText(label);
         applyPill(btn, frozen);
@@ -2927,12 +2980,18 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
 
         // Screen readers must hear both the action and the state, plus any block reason.
         Activity act = (btn.getContext() instanceof Activity) ? (Activity) btn.getContext() : null;
-        String scope = (act != null && targetUserFor(act) != 0) ? "分身应用，" : "";
+        String scope = (act != null && targetUserFor(act) != 0)
+                    ? tr("分身应用，", "clone app, ") : "";
         String desc;
         if (block != null) {
-            desc = scope + (frozen ? "已冻结，点此解冻" : "冻结此应用") + "。当前不可冻结：" + block;
+            desc = scope
+                        + (frozen ? tr("已冻结，点此解冻", "frozen, tap to unfreeze")
+                                  : tr("冻结此应用", "freeze this app"))
+                        + tr("。当前不可冻结：", ". Currently cannot freeze: ") + block;
         } else {
-            desc = scope + (frozen ? "已冻结，点此解冻" : "冻结此应用");
+            desc = scope
+                        + (frozen ? tr("已冻结，点此解冻", "frozen, tap to unfreeze")
+                                  : tr("冻结此应用", "freeze this app"));
         }
         btn.setContentDescription(desc);
     }

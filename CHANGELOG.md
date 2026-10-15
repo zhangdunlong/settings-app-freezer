@@ -16,6 +16,42 @@ LSPosed 官方模块仓库要求 Release 标签格式为 `{versionCode}-{version
 
 ---
 
+## [1.0.2] — 2026-10-15
+
+### 新增
+
+**界面文案跟随系统语言（中 / 英）**
+
+模块的全部界面文案此前固定为中文。现在按宿主语言自动切换中文或英文，
+覆盖操作栏按钮、已冻结列表弹窗、全部 Toast、长按诊断信息与读屏描述。
+
+- 新增 `isChinese()` / `tr(zh, en)`：读取宿主进程语言并选择对应文案
+- 语言取自 `Locale.getDefault()` —— Android 将该进程所属应用的配置写入进程默认语言，
+  因此在 Android 13+ 上**按应用设置语言**（例如系统中文、仅「设置」用英文）也能正确跟随，
+  与用户实际看到的页面一致
+- **不翻译**用于识别系统界面的字符串（`强行停止` / `Force stop`）：
+  它们必须保留系统实际显示的各种写法，翻译会导致页面识别失效
+
+### 变更
+
+- 全部说明性文案改为中英对照，统一 `中文 · English` 格式：
+  - `AndroidManifest.xml` 的 `xposeddescription`（LSPosed Manager 内显示）
+  - `SUMMARY`（模块索引页简介）
+  - 源码仓库 GitHub description
+
+### 真机验证（OnePlus PJZ110 / Android 16 / ColorOS）
+
+| 场景 | 结果 |
+|---|---|
+| 中文（系统默认） | `[分身] 冻结此应用` / `❄ 已冻结 0` |
+| 英文（仅「设置」应用设为 en-US） | `[Clone] ❄ Freeze this app` / `❄ Frozen 0` |
+| 英文下内容识别 | 按钮正常出现 —— 系统 UI 为 `Force stop` 时仍能识别应用信息页 |
+| 英文下冻结分身 | 999 → `enabled=3`，0/998 不变；`Frozen WeChat want=FREEZE readback=3` |
+| 英文下解冻分身 | 999 → `enabled=1`；`Unfrozen WeChat want=ENABLE readback=1` |
+| 英文下空列表弹窗 | `No frozen apps` + `GOT IT` |
+
+---
+
 ## [1.0.1] — 2026-10-15
 
 > **强烈建议升级**：本版修复了一个会**误冻结原版应用**的严重缺陷。
@@ -272,5 +308,6 @@ ColorOS 的详情页是**两段式 Activity 交接**：`InstalledAppDetailsTop` 
   （属于系统行为，与模块无关）；正常用户操作路径不受影响
 - 锁屏状态下通知面板会占据窗口焦点，自动化验证前需先解锁
 
+[1.0.2]: https://github.com/zhangdunlong/settings-app-freezer/releases/tag/102-1.0.2
 [1.0.1]: https://github.com/zhangdunlong/settings-app-freezer/releases/tag/101-1.0.1
 [1.0.0]: https://github.com/zhangdunlong/settings-app-freezer/releases/tag/100-1.0.0

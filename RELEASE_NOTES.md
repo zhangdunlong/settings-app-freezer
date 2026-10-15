@@ -1,78 +1,58 @@
-# settings-app-freezer v1.0.1
+# settings-app-freezer v1.0.2
 
-> **强烈建议升级** —— 本版修复了一个会**误冻结原版应用**的严重缺陷。
-
----
-
-## 本版修复
-
-### 冻结分身应用时误冻结原版（严重）
-
-在「设置 → 应用信息」页对**分身应用**点击冻结时，模块会：
-
-- ❌ 把**原版**应用冻结（而不是分身）
-- ❌ 同时报告「操作未生效」，让人以为什么都没发生
-
-也就是说，你以为只是冻结了分身，实际被停用的是主力账号里的那个应用。
-
-#### 根因
-
-Android 公开 API 的重载签名是：
-
-```java
-PackageManager.setApplicationEnabledSetting(String packageName, int newState, int flags)
-//                                                                        ↑ 不是 userId
-```
-
-第三个参数是 **flags**。旧实现按「用户 id」传入：
-
-```java
-pm.setApplicationEnabledSetting(pkg, state, cloneUserId);   // 语法合法，语义全错
-```
-
-用户 id 被静默塞进 flags 槽位，调用依然作用于**调用方所在的用户（0，即原版）**。
-
-读取路径同样失效：公开 API 没有 `getApplicationEnabledSetting(String, int)`，
-旧代码的反射调用抛 `NoSuchMethodException`，状态回读恒为默认值 ——
-所以界面完全无法反映分身的真实状态，也就无法及时发现写错了目标。
-
-#### 修复方式
-
-改为通过**用户域 Context** 取得绑定到目标用户的 `PackageManager`：
-
-```java
-Context userCtx = ctx.createPackageContextAsUser(ctx.getPackageName(), 0, UserHandle.of(userId));
-userCtx.getPackageManager().setApplicationEnabledSetting(pkg, state, 0);
-```
-
-用户由 Context 决定，之后读写都用普通公开 API，不再依赖易变的隐藏接口签名。
-
-并且加了硬性保护：**拿不到目标用户的 PackageManager 时直接抛异常拒绝执行**，
-绝不回退到调用方作用域 —— 宁可操作失败，也不能改动错误的用户。
-
-#### 实测对比（OnePlus PJZ110 / Android 16 / ColorOS，微信分身 user 999）
-
-| 用户 | 操作前 | v1.0.0 | v1.0.1 |
-|---|---|---|---|
-| 0（原版） | `enabled=1` | **`enabled=3` 被误冻结** | `enabled=1` ✅ |
-| 998 | `enabled=1` | `enabled=1` | `enabled=1` ✅ |
-| 999（目标分身） | `enabled=1` | `enabled=1` 没冻上 | **`enabled=3`** ✅ |
-
-### 其他
-
-- `undoFreeze()`（Toast 撤销）改为使用页面所属用户，原实现固定用当前进程用户，
-  在分身页面会指回原版
-- `build.sh` 增加版本一致性校验：`version.properties` 与 `AndroidManifest.xml`
-  不一致时直接构建失败（APK 版本实际取自 Manifest，此前无任何机制防止两者漂移）
+界面文案现在**跟随系统语言**自动切换中文 / 英文。
 
 ---
 
-## 升级前请自查
+## 本版内容
 
-如果你在 **v1.0.0** 上使用过「分身冻结」，请检查对应**原版应用**是否被误冻结：
+### 新增：界面文案跟随系统语言（中 / 英）
 
-- 系统设置 → 应用 → **已停用应用**
-- 或本模块应用信息页底部的 **「❄ 已冻结 N」** 列表（点击任意行即可解冻）
+模块的全部界面此前固定为中文。现在会按宿主语言显示对应文案，覆盖：
+
+- 操作栏按钮（冻结 / 解冻 / 已冻结列表入口）
+- 「已冻结应用」列表弹窗（含空状态）
+- 全部操作提示（冻结 / 解冻 / 撤销 / 各类失败原因）
+- 长按诊断信息
+- 读屏（TalkBack）朗读内容
+
+| | 中文环境 | 英文环境 |
+|---|---|---|
+| 按钮 | `[分身] 冻结此应用` | `[Clone] ❄ Freeze this app` |
+| 已冻结 | `❄ 已冻结 0` | `❄ Frozen 0` |
+| 空列表 | `暂无已冻结应用` | `No frozen apps` |
+| 操作结果 | `已冻结 微信` | `Frozen WeChat` |
+
+**关于语言来源**：语言取自宿主进程的 `Locale.getDefault()`。Android 会把该进程所属应用的
+语言配置写入进程默认值，所以在 Android 13+ 上**按应用设置语言**也有效 —— 例如系统是中文、
+只把「设置」改成英文时，模块会跟着「设置」显示英文，与用户眼前的界面一致。
+
+**刻意不翻译的部分**：用于识别系统界面的关键词（`强行停止` / `Force stop`）保持原样。
+它们必须匹配系统实际显示的文案，翻译了反而会让页面识别失效 —— 这也是英文系统下
+模块能正常工作的前提。
+
+### 变更：说明文案改为中英对照
+
+以下三处统一为 `中文 · English` 格式：
+
+- **LSPosed 里显示的模块描述**（`AndroidManifest` 的 `xposeddescription`）
+- **模块索引页简介**（`SUMMARY`）
+- **GitHub 仓库描述**
+
+模块显示名 `设置内冻结 · Settings App Freezer` 本就是双语，未改动。
+
+---
+
+## 真机验证（OnePlus PJZ110 / Android 16 / ColorOS）
+
+| 场景 | 结果 |
+|---|---|
+| 中文（系统默认） | `[分身] 冻结此应用` / `❄ 已冻结 0` |
+| 英文（仅「设置」应用设为 en-US） | `[Clone] ❄ Freeze this app` / `❄ Frozen 0` |
+| 英文下页面识别 | 按钮正常出现（系统 UI 显示 `Force stop`） |
+| 英文下冻结分身 | 仅目标分身 user 受影响，原版不受影响 |
+| 英文下解冻分身 | 恢复正常，日志 `Unfrozen WeChat want=ENABLE readback=1` |
+| 英文下空列表弹窗 | `No frozen apps` |
 
 ---
 
@@ -105,4 +85,4 @@ userCtx.getPackageManager().setApplicationEnabledSetting(pkg, state, 0);
 
 ---
 
-**完整变更**：<https://github.com/zhangdunlong/settings-app-freezer/compare/100-1.0.0...101-1.0.1>
+**完整变更**：<https://github.com/zhangdunlong/settings-app-freezer/compare/101-1.0.1...102-1.0.2>
