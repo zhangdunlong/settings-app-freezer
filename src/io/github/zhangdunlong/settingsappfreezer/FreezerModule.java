@@ -19,7 +19,10 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
+import android.util.DisplayMetrics;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.ViewTreeObserver;
@@ -132,6 +135,9 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
     private static final String PREFS = "settings_app_freezer_prefs";
     private static final String KEY_ALLOW_SYSTEM_FREEZE = "allow_freeze_system_apps";
     private static final String KEY_RISK_ACK_AT = "risk_ack_at";
+    /** Last drag position of the floating puck, stored as a fraction of the window. */
+    private static final String KEY_PUCK_X = "puck_x_ratio";
+    private static final String KEY_PUCK_Y = "puck_y_ratio";
 
     // CRITICAL: do NOT create a static Handler here. The class is initialised during
     // Zygote.specializeAppProcess(), before the main Looper exists, so
@@ -1991,33 +1997,36 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             int state = safeEnabledState(activity, pm, pkg);
             final boolean frozen = isFrozen(state);
 
-            // Horizontal bar: [ freeze/unfreeze ] [ frozen-apps list ]
-            // A LinearLayout is used instead of two sibling views so the pair is always centred
-            // together and never overlaps OEM bottom controls.
-            LinearLayout bar = new LinearLayout(activity);
-            bar.setOrientation(LinearLayout.HORIZONTAL);
-            bar.setGravity(Gravity.CENTER_VERTICAL);
-            bar.setTag(FROZEN_BAR_TAG);
+            // A floating, draggable puck instead of the old pinned bottom bar.
+            //
+            // The bar sat 150dp above the gesture bar and covered the last visible row of the
+            // app-info list: measured on realme UI (RMX1971, 1080x2340) the freeze pill occupied
+            // [145,1769]-[550,1890] while "App permissions" sat at [72,1823]-[264,1888], so that
+            // entry could not be tapped. A 56dp puck is draggable anywhere and covers ~15% of the
+            // width instead of the full row.
+            final int puckSize = dp(activity, 56);
 
-            // Use plain TextViews rather than Buttons: OEM themes (ColorOS/OPlus) restyle
-            // Button backgrounds and paddings so aggressively that the label ends up invisible
-            // (you see a coloured blob with no text). Self-drawn backgrounds are theme-independent.
-            TextView btn = new TextView(activity);
+            final FrameLayout puck = new FrameLayout(activity);
+            puck.setTag(FROZEN_BAR_TAG);
+
+            // Plain TextView, not Button: OEM themes restyle Button backgrounds and paddings so
+            // aggressively that the glyph disappears. Self-drawn oval backgrounds are
+            // theme-independent and render identically on AOSP and realme UI.
+            final TextView btn = new TextView(activity);
             btn.setTag(FROZEN_TAG);
-            btn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f);
+            btn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 22f);
             btn.setTypeface(Typeface.DEFAULT_BOLD);
             btn.setTextColor(Color.WHITE);
             btn.setGravity(Gravity.CENTER);
-            btn.setSingleLine(false);
-            btn.setMaxLines(2);
-            // 57% + 40% + the 10dp gap stays inside the window; the Chinese pair needs 55.6%
-            // and 39.0%, so this leaves the current Chinese layout visually unchanged.
-            capPillWidth(activity, btn, 0.57f);
+            btn.setSingleLine(true);
             btn.setIncludeFontPadding(false);
-            btn.setPadding(dp(activity, 22), dp(activity, 12),
-                    dp(activity, 22), dp(activity, 12));
-            btn.setElevation(dp(activity, 10));
-            applyPill(btn, frozen);
+            btn.setElevation(dp(activity, 8));
+            puck.addView(btn, new FrameLayout.LayoutParams(puckSize, puckSize));
+
+            FrameLayout.LayoutParams puckLp =
+                    new FrameLayout.LayoutParams(puckSize, puckSize);
+            puckLp.gravity = Gravity.TOP | Gravity.START;
+            puck.setLayoutParams(puckLp);
 
             // Resolve which Android user this page describes BEFORE the label is built, so the
             // "[分身]" prefix and the user-scoped state read are both correct from the first
@@ -2026,68 +2035,90 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             // landing on the phone's original app.
             resolveTargetUser(activity, pkg);
             int scopedState = readEnabledStateFor(activity, pm, pkg);
-            updateLabel(btn, scopedState, pkg);
+            updateBall(btn, scopedState, pkg);
 
-            LinearLayout.LayoutParams btnLp = new LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.WRAP_CONTENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT);
-            bar.addView(btn, btnLp);
-
-            // Entry point to the frozen-apps list. Shows a live count badge so the user can
-            // tell at a glance whether anything is frozen at all.
-            final TextView listBtn = buildListButton(activity);
-            LinearLayout.LayoutParams listLp = new LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.WRAP_CONTENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT);
-            listLp.leftMargin = dp(activity, 10);
-            listBtn.setLayoutParams(listLp);
-            bar.addView(listBtn, listLp);
-            refreshListBadge(listBtn);
-
-            FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
-                    FrameLayout.LayoutParams.WRAP_CONTENT,
-                    FrameLayout.LayoutParams.WRAP_CONTENT);
-            lp.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
-            lp.bottomMargin = dp(activity, 150); // clear of the gesture nav bar
-            bar.setLayoutParams(lp);
-            bar.setContentDescription(tr("冻结操作栏", "Freeze action bar"));
+            // Restore the last drag position as a fraction of the window, so the puck stays
+            // where the user left it across pages and app restarts. First run defaults to the
+            // bottom-right corner: on realme UI that band (below the last list row, above the
+            // nav bar) is empty, so nothing is covered until the user moves the puck itself.
+            final DisplayMetrics dm = activity.getResources().getDisplayMetrics();
+            final int screenW = dm.widthPixels;
+            final int screenH = dm.heightPixels;
+            float rx = freezerPrefs(activity).getFloat(KEY_PUCK_X, 0.92f);
+            float ry = freezerPrefs(activity).getFloat(KEY_PUCK_Y, 0.86f);
+            final float startX = clampFloat(rx * screenW - puckSize / 2f, 0, screenW - puckSize);
+            final float startY = clampFloat(ry * screenH - puckSize / 2f, 0, screenH - puckSize);
+            puck.setTranslationX(startX);
+            puck.setTranslationY(startY);
+            puck.setContentDescription(tr("冻结操作", "Freeze action"));
 
             final String target = pkg;
-            btn.setOnClickListener(new View.OnClickListener() {
+            final float[] downRaw = new float[2];
+            final float[] downTrans = new float[2];
+            final boolean[] dragging = {false};
+            final long[] downAt = {0};
+            final int slop = dp(activity, 8);
+
+            // One gesture handler covers tap / long-press / drag. Returning true on DOWN keeps
+            // the stream here; the gesture is classified on UP, so a drag can never fire a
+            // freeze and a long-press can never start one either.
+            btn.setOnTouchListener(new View.OnTouchListener() {
                 @Override
-                public void onClick(View v) {
-                    toggle(activity, (TextView) v, target);
-                }
-            });
-            btn.setOnLongClickListener(new View.OnLongClickListener() {
-                @Override
-                public boolean onLongClick(View v) {
-                    // Single secondary entry point: diagnostics + the (opt-in, high-risk)
-                    // system-app switch. Keeping them together avoids adding another pill to
-                    // the already-crowded bottom bar.
-                    showActionMenu(activity, target);
-                    return true;
-                }
-            });
-            listBtn.setOnClickListener(new View.OnClickListener() {
-                @Override
-                public void onClick(View v) {
-                    showFrozenList(activity);
+                public boolean onTouch(View v, MotionEvent e) {
+                    switch (e.getActionMasked()) {
+                        case MotionEvent.ACTION_DOWN:
+                            downRaw[0] = e.getRawX();
+                            downRaw[1] = e.getRawY();
+                            downTrans[0] = puck.getTranslationX();
+                            downTrans[1] = puck.getTranslationY();
+                            dragging[0] = false;
+                            downAt[0] = SystemClock.uptimeMillis();
+                            puck.setAlpha(0.85f);
+                            return true;
+                        case MotionEvent.ACTION_MOVE: {
+                            float dx = e.getRawX() - downRaw[0];
+                            float dy = e.getRawY() - downRaw[1];
+                            if (!dragging[0]
+                                    && (Math.abs(dx) > slop || Math.abs(dy) > slop)) {
+                                dragging[0] = true;
+                            }
+                            if (dragging[0]) {
+                                puck.setTranslationX(
+                                        clampFloat(downTrans[0] + dx, 0, screenW - puckSize));
+                                puck.setTranslationY(
+                                        clampFloat(downTrans[1] + dy, 0, screenH - puckSize));
+                            }
+                            return true;
+                        }
+                        case MotionEvent.ACTION_UP:
+                            puck.setAlpha(1f);
+                            if (dragging[0]) {
+                                savePuckPosition(activity, puck, screenW, screenH);
+                            } else if (SystemClock.uptimeMillis() - downAt[0] > 480L) {
+                                // Secondary entry point: frozen list + diagnostics + the
+                                // opt-in system-app switch, folded into one menu.
+                                showActionMenu(activity, target);
+                            } else {
+                                toggle(activity, btn, target);
+                            }
+                            return true;
+                        case MotionEvent.ACTION_CANCEL:
+                            puck.setAlpha(1f);
+                            return true;
+                        default:
+                            return false;
+                    }
                 }
             });
 
-            parent.addView(bar);
+            parent.addView(puck);
             markBarHost(activity);
-            bar.post(new Runnable() {
+            puck.post(new Runnable() {
                 @Override
                 public void run() {
-                    // Log the real measured size so a "coloured blob with no text" report can be
-                    // distinguished from a text-rendering issue.
-                    android.util.Log.i(TAG, "bar measured " + bar.getWidth() + "x" + bar.getHeight()
-                            + " btn='" + btn.getText() + "'"
-                            + " btnSize=" + btn.getWidth() + "x" + btn.getHeight()
-                            + " listBtn='" + listBtn.getText() + "'"
-                            + " listSize=" + listBtn.getWidth() + "x" + listBtn.getHeight());
+                    android.util.Log.i(TAG, "puck measured " + puck.getWidth() + "x"
+                            + puck.getHeight() + " at " + puck.getTranslationX()
+                            + "," + puck.getTranslationY());
                 }
             });
             XposedBridge.log(TAG + ": button bar injected for " + pkg
@@ -2570,6 +2601,9 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             }
             invalidateFrozenCount();
             clearFrozenAt(pkg);
+            // The page behind this dialog still renders the old "frozen" puck. Re-render it here,
+            // otherwise the user is left with a button claiming the app is frozen when it is not.
+            refreshFreezeButton(activity, pkg);
             toastWithUndo(activity, pkg, safeAppLabel(activity, pm, pkg));
             XposedBridge.log(TAG + ": unfrozen from list: " + pkg);
 
@@ -2667,7 +2701,12 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
     private void showActionMenu(final Activity activity, final String pkg) {
         try {
             final boolean on = allowSystemFreeze(activity);
+            // The frozen-apps list used to be a second always-visible pill. With a 56dp puck
+            // there is no room for it, so it becomes the first item of this menu — still one
+            // tap away, still showing a live count.
+            final int frozenN = frozenCountFor(activity);
             CharSequence[] items = new CharSequence[]{
+                    tr("已冻结应用", "Frozen apps") + " (" + frozenN + ")",
                     tr("查看诊断信息", "Diagnostics"),
                     on ? tr("冻结系统应用：已开启（点击关闭）",
                             "Freeze system apps: ON (tap to turn off)")
@@ -2680,8 +2719,10 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
                         @Override
                         public void onClick(DialogInterface d, int which) {
                             if (which == 0) {
-                                showDiagnostics(activity, pkg);
+                                showFrozenList(activity);
                             } else if (which == 1) {
+                                showDiagnostics(activity, pkg);
+                            } else if (which == 2) {
                                 if (on) {
                                     setAllowSystemFreeze(activity, false);
                                     refreshFreezeButton(activity, pkg);
@@ -2717,7 +2758,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             View v = ((ViewGroup) root).findViewWithTag(FROZEN_TAG);
             if (!(v instanceof TextView) || pkg == null) return;
             PackageManager pm = activity.getPackageManager();
-            updateLabel((TextView) v, readEnabledStateFor(activity, pm, pkg), pkg);
+            updateBall((TextView) v, readEnabledStateFor(activity, pm, pkg), pkg);
             XposedBridge.log(TAG + ": freeze button refreshed for " + pkg);
         } catch (Throwable t) {
             logOnce("refreshFreezeButton failed: " + t);
@@ -2925,7 +2966,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             invalidateFrozenCount();
             if (ok) markFrozenAt(pkg); else clearFrozenAt(pkg);
             if (btn != null) {
-                updateLabel(btn, newState, pkg);
+                updateBall(btn, newState, pkg);
                 refreshSiblingListBadge(btn);
             }
             String msg;
@@ -2967,7 +3008,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             invalidateFrozenCount();
             if (ok) clearFrozenAt(pkg);
             if (btn != null) {
-                updateLabel(btn, newState, pkg);
+                updateBall(btn, newState, pkg);
                 refreshSiblingListBadge(btn);
             }
             String msg = ok
@@ -3376,7 +3417,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
     // UI helpers
     // ------------------------------------------------------------------
 
-    private void updateLabel(TextView btn, int state, String pkg) {
+    private void updateBall(TextView btn, int state, String pkg) {
         boolean frozen = isFrozen(state);
         String block = null;
         try {
@@ -3393,46 +3434,90 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
         } catch (Throwable ignored) {
         }
 
-        // Text carries the state, so the UI never depends on colour alone (WCAG 1.4.1).
-        // In a clone user the label is prefixed so the user can never mistake the clone's
-        // button for the owner app's one.
-        String label = frozen
-                    ? tr("❄ 已冻结 · 点此解冻", "❄ Unfreeze")
-                    : tr("❄ 冻结此应用", "❄ Freeze");
-        if (targetUserFor((Activity) (btn.getContext() instanceof Activity
-                ? btn.getContext() : null)) != 0) {
-            label = frozen
-                        ? tr("[分身] 已冻结 · 点此解冻", "[Clone] Unfreeze")
-                        : tr("[分身] 冻结此应用", "[Clone] Freeze");
-        }
-        btn.setText(label);
-        applyPill(btn, frozen);
-        // System apps are marked in AMBER. Colour only — a "[系统]" text prefix would widen the
-        // pill past the 1440px English layout that was carefully capped in v1.0.2.
+        // A 56dp puck has no room for a sentence: the glyph stays constant and COLOUR carries
+        // the state (teal = freezable, mint = frozen, amber = system app). The full wording is
+        // moved into contentDescription so screen readers still hear it (WCAG 1.4.1).
         boolean systemApp = false;
         try {
             systemApp = isSystemApp(btn.getContext().getPackageManager(), pkg);
         } catch (Throwable ignored) {
         }
-        if (systemApp) applySystemPill(btn, frozen);
+        btn.setText("❄");
+        applyBall(btn, frozen, systemApp);
         btn.setAlpha(block != null ? 0.55f : 1f);
 
         // Screen readers must hear both the action and the state, plus any block reason.
-        Activity act = (btn.getContext() instanceof Activity) ? (Activity) btn.getContext() : null;
+        Activity act = null;
+        try {
+            Context c = btn.getContext();
+            if (c instanceof Activity) act = (Activity) c;
+        } catch (Throwable ignored) {
+        }
         String scope = (act != null && targetUserFor(act) != 0)
                     ? tr("分身应用，", "clone app, ") : "";
+        String what = systemApp ? tr("系统应用，", "system app, ") : "";
         String desc;
         if (block != null) {
-            desc = scope
+            desc = scope + what
                         + (frozen ? tr("已冻结，点此解冻", "frozen, tap to unfreeze")
                                   : tr("冻结此应用", "freeze this app"))
                         + tr("。当前不可冻结：", ". Currently cannot freeze: ") + block;
         } else {
-            desc = scope
+            desc = scope + what
                         + (frozen ? tr("已冻结，点此解冻", "frozen, tap to unfreeze")
-                                  : tr("冻结此应用", "freeze this app"));
+                                  : tr("冻结此应用", "freeze this app"))
+                        + tr("。长按打开菜单，拖动可移动",
+                             ". Long-press for options, drag to move");
         }
-        btn.setContentDescription((systemApp ? tr("系统应用，", "system app, ") : "") + desc);
+        btn.setContentDescription(desc);
+    }
+
+    /**
+     * Oval background for the floating puck. Same palette as the old pills, but drawn as a
+     * circle so a fixed 56dp footprint can carry it.
+     */
+    private static void applyBall(TextView ball, boolean frozen, boolean systemApp) {
+        int idle;
+        int pressed;
+        if (systemApp) {
+            idle = frozen ? ACCENT_SYSTEM_FROZEN : ACCENT_SYSTEM;
+            pressed = frozen ? ACCENT_SYSTEM_FROZEN_PRESSED : ACCENT_SYSTEM_PRESSED;
+        } else {
+            idle = frozen ? ACCENT_FROZEN : ACCENT;
+            pressed = frozen ? ACCENT_FROZEN_PRESSED : ACCENT_PRESSED;
+        }
+        GradientDrawable idleBg = new GradientDrawable();
+        idleBg.setShape(GradientDrawable.OVAL);
+        idleBg.setColor(idle);
+        GradientDrawable pressedBg = new GradientDrawable();
+        pressedBg.setShape(GradientDrawable.OVAL);
+        pressedBg.setColor(pressed);
+        StateListDrawable bg = new StateListDrawable();
+        bg.addState(new int[]{android.R.attr.state_pressed}, pressedBg);
+        bg.addState(new int[]{}, idleBg);
+        ball.setBackground(bg);
+        ball.setClickable(true);
+        ball.setFocusable(true);
+    }
+
+    private static float clampFloat(float v, float lo, float hi) {
+        return v < lo ? lo : (v > hi ? hi : v);
+    }
+
+    private static void savePuckPosition(Activity activity, View puck, int screenW, int screenH) {
+        try {
+            float cx = puck.getTranslationX() + puck.getWidth() / 2f;
+            float cy = puck.getTranslationY() + puck.getHeight() / 2f;
+            float rx = clampFloat(cx / Math.max(1, screenW), 0f, 1f);
+            float ry = clampFloat(cy / Math.max(1, screenH), 0f, 1f);
+            freezerPrefs(activity).edit()
+                    .putFloat(KEY_PUCK_X, rx)
+                    .putFloat(KEY_PUCK_Y, ry)
+                    .apply();
+            XposedBridge.log(TAG + ": puck moved to " + rx + "," + ry);
+        } catch (Throwable t) {
+            logOnce("savePuckPosition failed: " + t);
+        }
     }
 
     /** Amber variant of {@link #applyPill} for system apps; same states, different palette. */
