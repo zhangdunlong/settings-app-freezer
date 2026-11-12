@@ -4,7 +4,9 @@ import android.app.Activity;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.ContextWrapper;
+import android.content.DialogInterface;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
@@ -22,6 +24,9 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.ViewTreeObserver;
 import android.view.inputmethod.InputMethodManager;
+import android.widget.Button;
+import android.widget.CheckBox;
+import android.widget.CompoundButton;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -46,7 +51,11 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 /**
  * settings-app-freezer — 在系统设置的应用信息页注入「冻结 / 解冻」按钮的 Xposed 模块。
  *
- * <p>版本：1.0.0（见 {@code version.properties}，此注释需与之一致）
+ * <p>版本：1.0.3（见 {@code version.properties}，此注释需与之一致）
+ *
+ * <p>v1.0.3: system apps are blocked by default. Freezing them requires an explicit opt-in
+ * through the long-press menu, a checkbox-gated risk warning, and a per-package confirmation.
+ * All freeze writes go through {@link #performFreeze} so no entry point can skip those gates.
  * <p>许可证：GPL-3.0
  *
  * <p>Modern rewrite of the legacy "Native Freezer" Xposed module, which hooked AOSP Settings
@@ -107,6 +116,23 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
     private static final int ACCENT_FROZEN_PRESSED = 0xFF33998A;
     private static final int LIST_BADGE = 0xFF3A6EA5;       // entry button for the frozen list
 
+    // Amber = the target is a SYSTEM app. Colour only: adding a "[系统]" prefix would widen the
+    // pill past the 1440px English layout that was capped in v1.0.2.
+    private static final int ACCENT_SYSTEM = 0xFFC2601A;
+    private static final int ACCENT_SYSTEM_PRESSED = 0xFF9C4D14;
+    private static final int ACCENT_SYSTEM_FROZEN = 0xFFD98B3A;
+    private static final int ACCENT_SYSTEM_FROZEN_PRESSED = 0xFFB8722D;
+
+    /**
+     * The switch lives in the HOST settings process' private SharedPreferences: this module has
+     * no Activity and therefore cannot expose its own settings UI. Consequence: the switch is
+     * per Android user (clone users must enable it independently) and its file survives an
+     * uninstall of the module (harmless, and it fails closed to OFF on any read error).
+     */
+    private static final String PREFS = "settings_app_freezer_prefs";
+    private static final String KEY_ALLOW_SYSTEM_FREEZE = "allow_freeze_system_apps";
+    private static final String KEY_RISK_ACK_AT = "risk_ack_at";
+
     // CRITICAL: do NOT create a static Handler here. The class is initialised during
     // Zygote.specializeAppProcess(), before the main Looper exists, so
     // `new Handler(Looper.getMainLooper())` throws NPE (Looper.mQueue on a null Looper),
@@ -134,7 +160,11 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             "com.huawei.android.systemmanager"
     ));
 
-    /** Never freezable — freezing these would break the launcher, IME or the Settings UI. */
+    /**
+     * HARD BLOCKLIST — these are never freezable, even after "allow freezing system apps" is
+     * enabled. Freezing any of them can leave the device without a usable UI, without telephony
+     * or without a working package manager. This list is intentionally NOT configurable.
+     */
     private static final Set<String> CRITICAL_PKGS = new HashSet<>(Arrays.asList(
             MODULE_PKG,
             "android",
@@ -147,7 +177,15 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             "com.android.providers.media",
             "com.android.permissioncontroller",
             "com.android.vending",
-            "com.google.android.gms"
+            "com.google.android.gms",
+            // Telephony / radio / connectivity cores added with the system-app feature.
+            "com.android.phone",
+            "com.android.server.telecom",
+            "com.android.providers.telephony",
+            "com.android.bluetooth",
+            "com.android.nfc",
+            "com.android.networkstack",
+            "com.android.wifi"
     ));
 
     // ------------------------------------------------------------------
@@ -2024,7 +2062,10 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             btn.setOnLongClickListener(new View.OnLongClickListener() {
                 @Override
                 public boolean onLongClick(View v) {
-                    showDiagnostics(activity, target);
+                    // Single secondary entry point: diagnostics + the (opt-in, high-risk)
+                    // system-app switch. Keeping them together avoids adding another pill to
+                    // the already-crowded bottom bar.
+                    showActionMenu(activity, target);
                     return true;
                 }
             });
@@ -2418,23 +2459,19 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
         }
     }
 
-    /** Re-freezes a package from the undo affordance. */
+    /**
+     * Re-freezes a package from the undo affordance.
+     *
+     * <p>Routed through {@link #performFreeze} so this hidden-API path can no longer bypass
+     * {@link #criticalReason}, the system-app opt-in or the per-package confirmation — the old
+     * implementation called {@code pmsSetEnabled} directly and was the ONLY freeze entry that
+     * skipped every safety check. The frozen list is always a fresh query on open, so it is not
+     * rebuilt here (that would stack a second dialog on top of the confirmation dialog).
+     */
     private void undoFreeze(final Activity activity, final String pkg, final String label) {
         try {
-            pmsSetEnabled(activity, pkg,
-                    PackageManager.COMPONENT_ENABLED_STATE_DISABLED_USER,
-                    targetUserFor(activity));
-            int st = safeEnabledState(activity, activity.getPackageManager(), pkg);
-            if (isFrozen(st)) {
-                invalidateFrozenCount();
-                markFrozenAt(pkg);
-                toast(activity, tr("已恢复冻结 " + label, "Re-frozen " + label), Toast.LENGTH_SHORT);
-                showFrozenList(activity);
-            } else {
-                toast(activity, tr("撤销失败，系统拒绝了停用请求",
-                    "Undo failed: the system rejected the disable request"), Toast.LENGTH_LONG);
-            }
-            XposedBridge.log(TAG + ": undo freeze for " + pkg + " -> " + st);
+            performFreeze(activity, activity.getPackageManager(), pkg, null);
+            XposedBridge.log(TAG + ": undo freeze requested for " + pkg);
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": undo failed for " + pkg + ": " + t);
             toast(activity, tr("撤销失败", "Undo failed"), Toast.LENGTH_LONG);
@@ -2478,6 +2515,9 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
                 LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
 
         String label = safeAppLabel(activity, pm, pkg);
+        // Unlike the bottom pill, a list row has room for a text marker: an explicit "[系统]"
+        // prefix makes a frozen system app impossible to overlook in the recovery list.
+        if (isSystemApp(pm, pkg)) label = tr("[系统] ", "[System] ") + label;
         TextView name = new TextView(activity);
         name.setText(label);
         name.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f);
@@ -2576,51 +2616,387 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
     // Action
     // ------------------------------------------------------------------
 
-    private void toggle(Activity activity, TextView btn, String pkg) {
-        try {
-            PackageManager pm = activity.getPackageManager();
+    // ---- "Freeze system apps" opt-in switch ----------------------------------------
+    //
+    // The baseline build did NOT distinguish system apps at all: criticalReason() only blocked a
+    // small hard-coded set plus launcher / IME / foreground. Since this module runs INSIDE the
+    // system Settings process (which holds the signature permission), a system app could in fact
+    // be disabled with no warning whatsoever. v1.0.3 therefore fails closed: system apps are
+    // blocked by default and only become freezable after an explicit, acknowledged opt-in.
 
+    private static SharedPreferences freezerPrefs(Context ctx) {
+        return ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+    }
+
+    /** Fails CLOSED: any read error leaves the high-risk feature disabled. */
+    private static boolean allowSystemFreeze(Context ctx) {
+        try {
+            return freezerPrefs(ctx).getBoolean(KEY_ALLOW_SYSTEM_FREEZE, false);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private static void setAllowSystemFreeze(Context ctx, boolean on) {
+        try {
+            freezerPrefs(ctx).edit()
+                    .putBoolean(KEY_ALLOW_SYSTEM_FREEZE, on)
+                    .putLong(KEY_RISK_ACK_AT, on ? System.currentTimeMillis() : 0L)
+                    .apply();
+        } catch (Throwable t) {
+            logOnce("setAllowSystemFreeze failed: " + t);
+        }
+    }
+
+    /** /system or vendor-preinstalled app (includes updated system apps). */
+    private static boolean isSystemApp(PackageManager pm, String pkg) {
+        try {
+            ApplicationInfo ai = pm.getApplicationInfo(pkg, 0);
+            if (ai == null) return false;
+            int mask = ApplicationInfo.FLAG_SYSTEM | ApplicationInfo.FLAG_UPDATED_SYSTEM_APP;
+            return (ai.flags & mask) != 0;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * Long-press menu = the single secondary entry point. Diagnostics used to own the long-press
+     * gesture; the high-risk switch is added here rather than as another always-visible pill.
+     */
+    private void showActionMenu(final Activity activity, final String pkg) {
+        try {
+            final boolean on = allowSystemFreeze(activity);
+            CharSequence[] items = new CharSequence[]{
+                    tr("查看诊断信息", "Diagnostics"),
+                    on ? tr("冻结系统应用：已开启（点击关闭）",
+                            "Freeze system apps: ON (tap to turn off)")
+                       : tr("冻结系统应用：已关闭（点击开启）",
+                            "Freeze system apps: OFF (tap to turn on)")
+            };
+            new android.app.AlertDialog.Builder(activity)
+                    .setTitle(tr("冻结设置", "Freezer options"))
+                    .setItems(items, new DialogInterface.OnClickListener() {
+                        @Override
+                        public void onClick(DialogInterface d, int which) {
+                            if (which == 0) {
+                                showDiagnostics(activity, pkg);
+                            } else if (which == 1) {
+                                if (on) {
+                                    setAllowSystemFreeze(activity, false);
+                                    refreshFreezeButton(activity, pkg);
+                                    toast(activity,
+                                            tr("已关闭「冻结系统应用」；已冻结的应用不会自动解冻",
+                                               "System-app freezing off; already frozen apps are unchanged"),
+                                            Toast.LENGTH_LONG);
+                                    XposedBridge.log(TAG + ": ALLOW_SYSTEM_FREEZE=OFF");
+                                } else {
+                                    showSystemFreezeWarning(activity, pkg);
+                                }
+                            }
+                        }
+                    })
+                    .setNegativeButton(tr("关闭", "Close"), null)
+                    .show();
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": showActionMenu failed: " + t);
+            showDiagnostics(activity, pkg);      // degrade to the old behaviour
+        }
+    }
+
+    /**
+     * Re-renders the already-injected pill after the switch changes. Without this the button
+     * stays greyed out (it was rendered while system apps were blocked), so the user would see
+     * no visual feedback even though the switch is now ON.
+     */
+    private void refreshFreezeButton(Activity activity, String pkg) {
+        try {
+            View root = activity.getWindow() != null
+                    ? activity.getWindow().getDecorView() : resolveContentParent(activity);
+            if (!(root instanceof ViewGroup)) return;
+            View v = ((ViewGroup) root).findViewWithTag(FROZEN_TAG);
+            if (!(v instanceof TextView) || pkg == null) return;
+            PackageManager pm = activity.getPackageManager();
+            updateLabel((TextView) v, readEnabledStateFor(activity, pm, pkg), pkg);
+            XposedBridge.log(TAG + ": freeze button refreshed for " + pkg);
+        } catch (Throwable t) {
+            logOnce("refreshFreezeButton failed: " + t);
+        }
+    }
+
+    /**
+     * Gate #1 (before enabling): an explicit, itemised warning. The positive button stays
+     * disabled until the acknowledgement checkbox is ticked, so the feature can never be turned
+     * on by a stray tap.
+     */
+    private void showSystemFreezeWarning(final Activity activity, final String pkg) {
+        try {
+            LinearLayout box = new LinearLayout(activity);
+            box.setOrientation(LinearLayout.VERTICAL);
+            int pad = dp(activity, 20);
+            box.setPadding(pad, pad, pad, pad);
+
+            TextView body = new TextView(activity);
+            body.setText(tr(
+                    "此功能允许停用系统预置应用。系统应用之间存在依赖关系，误冻可能导致：\n\n"
+                    + "· 系统功能异常、应用频繁停止运行或开机卡住\n"
+                    + "· 通知、推送、账号同步、闹钟等后台服务失效\n"
+                    + "· 系统更新（OTA）或应用更新校验失败\n\n"
+                    + "以下组件永远不可冻结：系统框架、设置、SystemUI、当前桌面、当前输入法、"
+                    + "电话/通信、蓝牙、NFC、网络栈、权限控制器、本模块自身。\n\n"
+                    + "若设备出现异常，可在「已冻结应用列表」中一键解冻；无法进入系统时使用：\n"
+                    + "adb shell pm enable --user <用户ID> <包名>\n\n"
+                    + "该开关仅对当前 Android 用户生效，分身用户需分别开启。",
+                    "This allows disabling preinstalled system apps. System apps depend on each "
+                    + "other; freezing the wrong one may cause:\n\n"
+                    + "- System features failing, repeated app crashes or a boot loop\n"
+                    + "- Notifications, push, account sync and alarms stopping\n"
+                    + "- OTA / app updates failing verification\n\n"
+                    + "Never freezable even with this switch ON: framework, Settings, SystemUI, "
+                    + "current launcher, active input method, telephony, Bluetooth, NFC, network "
+                    + "stack, permission controller and this module.\n\n"
+                    + "To recover, unfreeze from the frozen-apps list; if the UI is unusable run:\n"
+                    + "adb shell pm enable --user <userId> <package>\n\n"
+                    + "The switch is per Android user; clone users must enable it separately."));
+            body.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f);
+            body.setTextColor(0xFF1A1A1A);
+            body.setLineSpacing(dp(activity, 3), 1f);
+            box.addView(body);
+
+            final CheckBox ack = new CheckBox(activity);
+            ack.setText(tr("我已阅读并了解上述风险",
+                           "I have read and understand the risks above"));
+            ack.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f);
+            ack.setTextColor(0xFF1A1A1A);
+            ack.setPadding(0, dp(activity, 12), 0, 0);
+            box.addView(ack);
+
+            ScrollView scroll = new ScrollView(activity);
+            scroll.addView(box);
+
+            final android.app.AlertDialog dlg = new android.app.AlertDialog.Builder(activity)
+                    .setTitle(tr("⚠ 高风险功能：冻结系统应用",
+                                 "⚠ High-risk: freeze system apps"))
+                    .setView(scroll)
+                    .setNegativeButton(tr("取消", "Cancel"), null)
+                    .setPositiveButton(tr("启用", "Enable"), null)
+                    .create();
+            dlg.setOnShowListener(new DialogInterface.OnShowListener() {
+                @Override
+                public void onShow(DialogInterface d) {
+                    final Button positive = dlg.getButton(DialogInterface.BUTTON_POSITIVE);
+                    if (positive == null) return;
+                    positive.setEnabled(false);
+                    ack.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
+                        @Override
+                        public void onCheckedChanged(CompoundButton b, boolean checked) {
+                            positive.setEnabled(checked);
+                        }
+                    });
+                    positive.setOnClickListener(new View.OnClickListener() {
+                        @Override
+                        public void onClick(View v) {
+                            if (!ack.isChecked()) return;
+                            setAllowSystemFreeze(activity, true);
+                            refreshFreezeButton(activity, pkg);
+                            dlg.dismiss();
+                            toast(activity,
+                                    tr("已启用「冻结系统应用」，冻结前仍会逐次确认",
+                                       "Enabled; each system-app freeze still needs confirmation"),
+                                    Toast.LENGTH_LONG);
+                            XposedBridge.log(TAG + ": ALLOW_SYSTEM_FREEZE=ON (risk acknowledged)");
+                        }
+                    });
+                }
+            });
+            dlg.show();
+            XposedBridge.log(TAG + ": system-freeze risk warning shown");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": showSystemFreezeWarning failed: " + t);
+            toast(activity, tr("无法启用高风险功能（界面创建失败）",
+                               "Could not enable the high-risk feature (dialog failed)"),
+                    Toast.LENGTH_LONG);
+        }
+    }
+
+    /**
+     * Gate #2 (per freeze): every single system-app freeze needs its own confirmation. No
+     * "don't ask again" for this session — the operation is rare and the blast radius is large.
+     * Failure to build the dialog REFUSES the freeze (fail-safe).
+     */
+    private void confirmSystemFreeze(final Activity activity, final String pkg,
+                                     final Runnable onConfirm) {
+        try {
+            final PackageManager pm = activity.getPackageManager();
+            final String name = safeAppLabel(activity, pm, pkg);
+            final int user = targetUserFor(activity);
+            StringBuilder body = new StringBuilder();
+            body.append(tr("应用：", "App: ")).append(name).append('\n');
+            body.append(tr("包名：", "Package: ")).append(pkg).append('\n');
+            body.append(tr("目标用户：", "Target user: ")).append(user).append('\n');
+            body.append(tr("类型：系统应用（非用户安装）",
+                           "Type: system app (not user-installed)")).append("\n\n");
+            body.append(tr("冻结后该应用及其后台服务会停止，可能导致系统功能异常、通知失效、"
+                           + "开机卡顿或系统更新失败。",
+                           "Freezing stops this app and its services. It may break system "
+                           + "features, notifications, boot or OTA updates.")).append("\n\n");
+            body.append(tr("紧急恢复：", "Emergency restore: "))
+                    .append("adb shell pm enable --user ").append(user).append(' ')
+                    .append(pkg).append('\n');
+            body.append(tr("或在「已冻结应用列表」中点击该应用一键解冻。",
+                           "Or tap the app in the frozen list to unfreeze."));
+
+            LinearLayout box = new LinearLayout(activity);
+            box.setOrientation(LinearLayout.VERTICAL);
+            int pad = dp(activity, 20);
+            box.setPadding(pad, pad, pad, pad);
+            TextView tv = new TextView(activity);
+            tv.setText(body.toString());
+            tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f);
+            tv.setTextColor(0xFF1A1A1A);
+            tv.setLineSpacing(dp(activity, 3), 1f);
+            box.addView(tv);
+            ScrollView scroll = new ScrollView(activity);
+            scroll.addView(box);
+
+            new android.app.AlertDialog.Builder(activity)
+                    .setTitle(tr("⚠ 即将冻结系统应用", "⚠ Freezing a system app"))
+                    .setView(scroll)
+                    .setNegativeButton(tr("取消", "Cancel"), null)
+                    .setPositiveButton(tr("仍要冻结", "Freeze anyway"),
+                            new DialogInterface.OnClickListener() {
+                                @Override
+                                public void onClick(DialogInterface d, int w) {
+                                    XposedBridge.log(TAG + ": system-freeze confirmed for " + pkg
+                                            + " user=" + user);
+                                    onConfirm.run();
+                                }
+                            })
+                    .setCancelable(true)
+                    .show();
+            XposedBridge.log(TAG + ": system-freeze confirmation shown for " + pkg);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": confirmSystemFreeze failed, refusing: " + t);
+            toast(activity, tr("未能弹出风险确认，已取消冻结",
+                               "Confirmation unavailable; freeze cancelled"), Toast.LENGTH_LONG);
+        }
+    }
+
+    /**
+     * SINGLE freeze facade. Every entry point that can write DISABLED_USER goes through here —
+     * including the Toast "undo" path, which previously called pmsSetEnabled() directly and thus
+     * bypassed criticalReason() entirely. No future entry point may skip this method.
+     */
+    private void performFreeze(final Activity activity, final PackageManager pm,
+                               final String pkg, final TextView btn) {
+        try {
             String block = criticalReason(activity, pm, pkg);
             if (block != null) {
                 toast(activity, tr("已阻止冻结：", "Freeze blocked: ") + block, Toast.LENGTH_LONG);
                 XposedBridge.log(TAG + ": blocked freeze of " + pkg + " (" + block + ")");
                 return;
             }
+            if (isSystemApp(pm, pkg) && allowSystemFreeze(activity)) {
+                confirmSystemFreeze(activity, pkg, new Runnable() {
+                    @Override
+                    public void run() {
+                        freezeNow(activity, pm, pkg, btn);
+                    }
+                });
+                return;
+            }
+            freezeNow(activity, pm, pkg, btn);
+        } catch (Throwable t) {
+            toast(activity, tr("操作失败：", "Operation failed: ") + t.getMessage(), Toast.LENGTH_LONG);
+            XposedBridge.log(TAG + ": performFreeze failed for " + pkg + ": " + t);
+        }
+    }
 
-            int s = readEnabledStateFor(activity, pm, pkg);
-            boolean wasFrozen = isFrozen(s);
-            boolean wantFreeze = !wasFrozen;          // intent, not enum value
-            int next = wantFreeze
-                    ? PackageManager.COMPONENT_ENABLED_STATE_DISABLED_USER
-                    : PackageManager.COMPONENT_ENABLED_STATE_ENABLED;
-
-            pmsSetEnabled(activity, pkg, next, targetUserFor(activity));
+    private void freezeNow(Activity activity, PackageManager pm, String pkg, TextView btn) {
+        try {
+            final boolean system = isSystemApp(pm, pkg);
+            pmsSetEnabled(activity, pkg, PackageManager.COMPONENT_ENABLED_STATE_DISABLED_USER,
+                    targetUserFor(activity));
 
             // Read-back is the ONLY source of truth: setApplicationEnabledSetting() can silently
-            // no-op when the caller lacks the signature permission, so we must verify the actual
-            // state instead of assuming the call succeeded.
+            // no-op (especially for system apps) when the caller lacks the required permission.
             int newState = readEnabledStateFor(activity, pm, pkg);
-            boolean nowFrozen = isFrozen(newState);
-            boolean ok = (nowFrozen == wantFreeze);
-
+            boolean ok = isFrozen(newState);
             invalidateFrozenCount();
-            if (nowFrozen) markFrozenAt(pkg); else clearFrozenAt(pkg);
-            updateLabel(btn, newState, pkg);
-            refreshSiblingListBadge(btn);
-            String msg = ok
-                    ? (wantFreeze
-                            ? tr("已冻结 ", "Frozen ") + labelOf(pm, pkg)
-                            : tr("已解冻 ", "Unfrozen ") + labelOf(pm, pkg))
-                    : tr("操作未生效（可能被系统/安全软件拦截）",
-                            "No effect (blocked by the system or a security app)");
+            if (ok) markFrozenAt(pkg); else clearFrozenAt(pkg);
+            if (btn != null) {
+                updateLabel(btn, newState, pkg);
+                refreshSiblingListBadge(btn);
+            }
+            String msg;
+            if (!ok) {
+                msg = tr("操作未生效（可能被系统/安全软件拦截）",
+                         "No effect (blocked by the system or a security app)");
+            } else if (system) {
+                msg = tr("已冻结系统应用 ", "Frozen system app ") + labelOf(pm, pkg)
+                        + tr("　可在已冻结列表一键解冻", "  Undo from the frozen list");
+            } else {
+                msg = tr("已冻结 ", "Frozen ") + labelOf(pm, pkg);
+            }
             toast(activity, msg, ok ? Toast.LENGTH_SHORT : Toast.LENGTH_LONG);
-            XposedBridge.log(TAG + ": " + msg + " want=" + (wantFreeze ? "FREEZE" : "ENABLE")
-                    + " readback=" + newState);
+            XposedBridge.log(TAG + ": " + msg + " want=FREEZE readback=" + newState
+                    + " system=" + system);
         } catch (SecurityException se) {
             toast(activity, tr("无权限停用该应用（需系统签名权限）",
                         "Not permitted to disable this app (needs system signature permission)"),
                     Toast.LENGTH_LONG);
             XposedBridge.log(TAG + ": SecurityException for " + pkg + ": " + se);
+        } catch (Throwable t) {
+            toast(activity, tr("操作失败：", "Operation failed: ") + t.getMessage(), Toast.LENGTH_LONG);
+            XposedBridge.log(TAG + ": freezeNow failed for " + pkg + ": " + t);
+        }
+    }
+
+    /**
+     * Unfreezing is the SAFE direction, so criticalReason() is deliberately NOT consulted here:
+     * a system app frozen while the switch was ON must still be recoverable after the switch is
+     * turned OFF. The old toggle() blocked both directions, which could trap such an app.
+     */
+    private void unfreezeNow(Activity activity, PackageManager pm, String pkg, TextView btn) {
+        try {
+            final boolean system = isSystemApp(pm, pkg);
+            pmsSetEnabled(activity, pkg, PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
+                    targetUserFor(activity));
+            int newState = readEnabledStateFor(activity, pm, pkg);
+            boolean ok = !isFrozen(newState);
+            invalidateFrozenCount();
+            if (ok) clearFrozenAt(pkg);
+            if (btn != null) {
+                updateLabel(btn, newState, pkg);
+                refreshSiblingListBadge(btn);
+            }
+            String msg = ok
+                    ? tr("已解冻 ", "Unfrozen ") + labelOf(pm, pkg)
+                    : tr("操作未生效（可能被系统/安全软件拦截）",
+                         "No effect (blocked by the system or a security app)");
+            toast(activity, msg, ok ? Toast.LENGTH_SHORT : Toast.LENGTH_LONG);
+            XposedBridge.log(TAG + ": " + msg + " want=ENABLE readback=" + newState
+                    + " system=" + system);
+        } catch (SecurityException se) {
+            toast(activity, tr("无权限停用该应用（需系统签名权限）",
+                        "Not permitted to disable this app (needs system signature permission)"),
+                    Toast.LENGTH_LONG);
+            XposedBridge.log(TAG + ": SecurityException for " + pkg + ": " + se);
+        } catch (Throwable t) {
+            toast(activity, tr("操作失败：", "Operation failed: ") + t.getMessage(), Toast.LENGTH_LONG);
+            XposedBridge.log(TAG + ": unfreezeNow failed for " + pkg + ": " + t);
+        }
+    }
+
+    private void toggle(Activity activity, TextView btn, String pkg) {
+        try {
+            PackageManager pm = activity.getPackageManager();
+            int s = readEnabledStateFor(activity, pm, pkg);
+            if (isFrozen(s)) {
+                unfreezeNow(activity, pm, pkg, btn);
+            } else {
+                performFreeze(activity, pm, pkg, btn);
+            }
         } catch (Throwable t) {
             toast(activity, tr("操作失败：", "Operation failed: ") + t.getMessage(), Toast.LENGTH_LONG);
             XposedBridge.log(TAG + ": toggle failed for " + pkg + ": " + t);
@@ -2900,6 +3276,25 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
     private String criticalReason(Activity activity, PackageManager pm, String pkg) {
         if (CRITICAL_PKGS.contains(pkg)) return tr("系统关键包 ", "critical system package ") + pkg;
 
+        // v1.0.3: fail closed for system apps. The "allow freezing system apps" switch is OFF
+        // by default, and persistent system processes are never freezable even when it is ON.
+        try {
+            ApplicationInfo ai = pm.getApplicationInfo(pkg, 0);
+            if (ai != null) {
+                if ((ai.flags & ApplicationInfo.FLAG_PERSISTENT) != 0) {
+                    return tr("常驻系统进程", "persistent system process");
+                }
+                int sysMask = ApplicationInfo.FLAG_SYSTEM | ApplicationInfo.FLAG_UPDATED_SYSTEM_APP;
+                if ((ai.flags & sysMask) != 0 && !allowSystemFreeze(activity)) {
+                    return tr("系统应用（默认禁止；长按按钮可开启）",
+                              "system app (blocked by default; enable via long-press menu)");
+                }
+            }
+        } catch (Throwable ignored) {
+            // Cannot prove this is a user-installed app — refuse rather than risk a system freeze.
+            return tr("无法校验应用类型（已阻止）", "cannot verify app type (blocked)");
+        }
+
         // Current launcher(s) — freezing the launcher would leave the user with no home.
         try {
             Intent home = new Intent(Intent.ACTION_MAIN);
@@ -2960,12 +3355,13 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
         try {
             PackageManager pm = activity.getPackageManager();
             int s = safeEnabledState(activity, pm, pkg);
-            ApplicationInfo ai = pm.getApplicationInfo(pkg, 0);
             StringBuilder sb = new StringBuilder();
             sb.append(pkg).append("\n");
             sb.append(tr("状态: ", "State: ")).append(stateToName(s)).append("\n");
             sb.append(tr("系统应用: ", "System app: "))
-                    .append((ai.flags & ApplicationInfo.FLAG_SYSTEM) != 0).append("\n");
+                    .append(isSystemApp(pm, pkg)).append("\n");
+            sb.append(tr("允许冻结系统应用: ", "Allow system freeze: "))
+                    .append(allowSystemFreeze(activity)).append("\n");
             String block = criticalReason(activity, pm, pkg);
             sb.append(tr("保护: ", "Protection: "))
                     .append(block == null ? tr("无（可冻结）", "none (freezable)") : block);
@@ -3011,6 +3407,14 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
         }
         btn.setText(label);
         applyPill(btn, frozen);
+        // System apps are marked in AMBER. Colour only — a "[系统]" text prefix would widen the
+        // pill past the 1440px English layout that was carefully capped in v1.0.2.
+        boolean systemApp = false;
+        try {
+            systemApp = isSystemApp(btn.getContext().getPackageManager(), pkg);
+        } catch (Throwable ignored) {
+        }
+        if (systemApp) applySystemPill(btn, frozen);
         btn.setAlpha(block != null ? 0.55f : 1f);
 
         // Screen readers must hear both the action and the state, plus any block reason.
@@ -3028,7 +3432,20 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
                         + (frozen ? tr("已冻结，点此解冻", "frozen, tap to unfreeze")
                                   : tr("冻结此应用", "freeze this app"));
         }
-        btn.setContentDescription(desc);
+        btn.setContentDescription((systemApp ? tr("系统应用，", "system app, ") : "") + desc);
+    }
+
+    /** Amber variant of {@link #applyPill} for system apps; same states, different palette. */
+    private static void applySystemPill(TextView btn, boolean frozen) {
+        int idle = frozen ? ACCENT_SYSTEM_FROZEN : ACCENT_SYSTEM;
+        int pressed = frozen ? ACCENT_SYSTEM_FROZEN_PRESSED : ACCENT_SYSTEM_PRESSED;
+        StateListDrawable bg = new StateListDrawable();
+        bg.addState(new int[]{android.R.attr.state_focused}, ring(pressed));
+        bg.addState(new int[]{android.R.attr.state_pressed}, solidWith(pressed));
+        bg.addState(new int[]{}, solidWith(idle));
+        btn.setBackground(bg);
+        btn.setFocusable(true);
+        btn.setClickable(true);
     }
 
     /**

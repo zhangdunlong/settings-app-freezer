@@ -1,1 +1,1 @@
-在系统设置的应用信息页注入「冻结 / 解冻」按钮，一键停用任意用户应用。 · Adds a freeze/unfreeze button to the system Settings app-info page to disable any user app in one tap.
+在系统设置的应用信息页注入「冻结 / 解冻」按钮，停用用户应用；可选开启「冻结系统应用」（默认关闭，启用前强制风险确认）。 · Adds freeze/unfreeze buttons to the Settings app-info page, with an opt-in, risk-gated system-app freezing mode (off by default).
