@@ -139,6 +139,19 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
     private static final String KEY_PUCK_X = "puck_x_ratio";
     private static final String KEY_PUCK_Y = "puck_y_ratio";
 
+    /**
+     * No-op click handler for dialogs whose button only needs to dismiss them. A {@code null}
+     * listener makes {@code AlertController} grey the button out (and on some OEMs hides the
+     * affordance entirely), so "Close"/"Cancel"/"Got it" buttons must never pass null.
+     */
+    private static final DialogInterface.OnClickListener DISMISS =
+            new DialogInterface.OnClickListener() {
+                @Override
+                public void onClick(DialogInterface d, int which) {
+                    // default: dismiss the dialog
+                }
+            };
+
     // CRITICAL: do NOT create a static Handler here. The class is initialised during
     // Zygote.specializeAppProcess(), before the main Looper exists, so
     // `new Handler(Looper.getMainLooper())` throws NPE (Looper.mQueue on a null Looper),
@@ -834,9 +847,12 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
                 }
             }
             if (pkg == null) return;
-            // Content gate for the remembered/fallback case only; a package parsed straight from
-            // this Activity's own Intent is trustworthy enough on its own.
-            if (pkg.equals(lastResolvedPkg) && !looksLikeAppInfoContent(content)) {
+            // ALWAYS require app-info content before injecting via the focus fast-path. A package
+            // resolved from the Intent or Activity fields does NOT prove the window is an app-info
+            // page — SubSettings storage/notification/usage pages also carry the package in
+            // navigate_parent_package — and trusting it put the puck on unrelated pages whenever
+            // the resolved package differed from the last remembered one.
+            if (!looksLikeAppInfoContent(content)) {
                 XposedBridge.log(TAG + ": focus fast-path skipped, content is not app-info for " + pkg);
                 return;
             }
@@ -2368,7 +2384,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
 
             android.app.AlertDialog dialog = new android.app.AlertDialog.Builder(activity)
                     .setView(scroll)
-                    .setPositiveButton(tr("关闭", "Close"), null)
+                    .setPositiveButton(tr("关闭", "Close"), DISMISS)
                     .create();
             dialog.setCanceledOnTouchOutside(true);
             activeListDialog = dialog;
@@ -2441,7 +2457,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
 
             android.app.AlertDialog dialog = new android.app.AlertDialog.Builder(activity)
                     .setView(box)
-                    .setPositiveButton(tr("知道了", "Got it"), null)
+                    .setPositiveButton(tr("知道了", "Got it"), DISMISS)
                     .create();
             dialog.setCanceledOnTouchOutside(true);
             activeListDialog = dialog;
@@ -2737,7 +2753,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
                             }
                         }
                     })
-                    .setNegativeButton(tr("关闭", "Close"), null)
+                    .setNegativeButton(tr("关闭", "Close"), DISMISS)
                     .show();
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": showActionMenu failed: " + t);
@@ -2819,33 +2835,50 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
                     .setTitle(tr("⚠ 高风险功能：冻结系统应用",
                                  "⚠ High-risk: freeze system apps"))
                     .setView(scroll)
-                    .setNegativeButton(tr("取消", "Cancel"), null)
-                    .setPositiveButton(tr("启用", "Enable"), null)
+                    // Non-null listeners so Android never auto-disables the buttons (a null
+                    // listener makes AlertController grey the button out on stock builds).
+                    .setNegativeButton(tr("取消", "Cancel"),
+                            new DialogInterface.OnClickListener() {
+                                @Override
+                                public void onClick(DialogInterface d, int w) {
+                                    // default: dismiss
+                                }
+                            })
+                    // The click handler lives HERE (not via getButton in onShow) so it can never
+                    // be lost when getButton returns null due to an OEM dialog timing change.
+                    .setPositiveButton(tr("启用", "Enable"),
+                            new DialogInterface.OnClickListener() {
+                                @Override
+                                public void onClick(DialogInterface d, int w) {
+                                    if (!ack.isChecked()) {
+                                        toast(activity,
+                                                tr("请先勾选「我已阅读并了解上述风险」",
+                                                   "Please tick the acknowledgement first"),
+                                                Toast.LENGTH_SHORT);
+                                        return;   // keep the dialog open
+                                    }
+                                    setAllowSystemFreeze(activity, true);
+                                    refreshFreezeButton(activity, pkg);
+                                    toast(activity,
+                                            tr("已启用「冻结系统应用」，冻结前仍会逐次确认",
+                                               "Enabled; each system-app freeze still needs confirmation"),
+                                            Toast.LENGTH_LONG);
+                                    XposedBridge.log(TAG + ": ALLOW_SYSTEM_FREEZE=ON (risk acknowledged)");
+                                }
+                            })
                     .create();
+            // Grey the Enable button until the checkbox is ticked. If getButton is null the
+            // listener above still enforces the acknowledgement, so enabling is never ungated.
             dlg.setOnShowListener(new DialogInterface.OnShowListener() {
                 @Override
                 public void onShow(DialogInterface d) {
                     final Button positive = dlg.getButton(DialogInterface.BUTTON_POSITIVE);
                     if (positive == null) return;
-                    positive.setEnabled(false);
+                    positive.setEnabled(ack.isChecked());
                     ack.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
                         @Override
                         public void onCheckedChanged(CompoundButton b, boolean checked) {
                             positive.setEnabled(checked);
-                        }
-                    });
-                    positive.setOnClickListener(new View.OnClickListener() {
-                        @Override
-                        public void onClick(View v) {
-                            if (!ack.isChecked()) return;
-                            setAllowSystemFreeze(activity, true);
-                            refreshFreezeButton(activity, pkg);
-                            dlg.dismiss();
-                            toast(activity,
-                                    tr("已启用「冻结系统应用」，冻结前仍会逐次确认",
-                                       "Enabled; each system-app freeze still needs confirmation"),
-                                    Toast.LENGTH_LONG);
-                            XposedBridge.log(TAG + ": ALLOW_SYSTEM_FREEZE=ON (risk acknowledged)");
                         }
                     });
                 }
@@ -2903,7 +2936,7 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             new android.app.AlertDialog.Builder(activity)
                     .setTitle(tr("⚠ 即将冻结系统应用", "⚠ Freezing a system app"))
                     .setView(scroll)
-                    .setNegativeButton(tr("取消", "Cancel"), null)
+                    .setNegativeButton(tr("取消", "Cancel"), DISMISS)
                     .setPositiveButton(tr("仍要冻结", "Freeze anyway"),
                             new DialogInterface.OnClickListener() {
                                 @Override

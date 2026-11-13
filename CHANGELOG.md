@@ -10,6 +10,47 @@ LSPosed 官方模块仓库要求 Release 标签格式为 `{versionCode}-{version
 
 ---
 
+## [1.0.5] — 2026-11-13
+
+> 三个问题的修复，均已在 realme RMX1971（realme UI V11.1 / Android 11 / Magisk + Vector）真机复现并验证。
+
+### 修复：LSPosed 管理器「推荐作用域」不显示
+
+- **根因**：`AndroidManifest.xml` 的 `xposedscope` 元数据用**冒号**（`:`）分隔包名，
+  而 LSPosed 官方约定硬编码格式为**分号**（`;`）。冒号让整串被当成一个不存在的包名
+  `com.android.settings:com.coloros.settings:…`，推荐作用域解析为空。
+- **修复**：改为分号分隔。启用模块时，`com.android.settings` 及各大 OEM 设置包会被
+  自动纳入推荐作用域，无需手动逐包勾选。
+
+### 修复：「冻结系统应用」警示对话框按钮异常
+
+- **根因**：`AlertDialog.Builder.setXxxButton(…, null)` 传入 `null` 监听器时，
+  `AlertController` 会把按钮置灰禁用（「取消」「关闭」等按钮因此不可点）；「启用」
+  按钮的点击逻辑又依赖 `onShow` 里 `getButton()`，存在 OEM 时序变化下拿不到按钮、
+  监听器丢失的风险。
+- **修复**：所有「取消/关闭/知道了」按钮统一改用非空 no-op 监听器（`DISMISS`）；
+  「启用」的点击逻辑改由 `setPositiveButton(listener)` 直接承载（内部校验勾选），
+  `onShow` 仅负责「未勾选时置灰」的视觉。勾选前「启用」灰、勾选后变可点、未勾选点
+  「启用」仅提示不关闭对话框。
+
+### 修复：悬浮球出现在非应用信息页
+
+- **根因**：`tryDirectInjectOnFocus` 仅对「记忆包名」做内容校验；当包名从 Intent 或
+  Activity 字段直接解析出来时跳过校验直接注入。而 Settings 的存储/通知/用量等子页
+  也会在 `navigate_parent_package` 里携带包名，一旦该包名与上次记忆的不同，球就被
+  错误注入到这些无关页面。
+- **修复**：focus 快速路径**无条件**要求当前内容为应用信息页（含「强行停止」操作）
+  才注入。真机验证：存储页（`SubSettings`）、耗电管理（`com.coloros.oppoguardelf`）、
+  通知管理（`com.coloros.notificationmanager`）、应用权限（`com.android.permissioncontroller`）
+  均不再注入，应用信息页正常注入。
+
+### 其他
+
+- 解冻真机上遗留的 `com.android.nfc`（旧版本在硬白名单加入前被冻结，属系统关键包，
+  已在 `CRITICAL_PKGS` 内）。
+
+---
+
 ## [1.0.4] — 2026-11-12
 
 > 已在 realme RMX1971（realme UI V11.1 / Android 11）真机完成全功能验证，见文末验证记录。
