@@ -2381,6 +2381,11 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
 
             ScrollView scroll = new ScrollView(activity);
             scroll.addView(list);
+            // Cap the list height so a long frozen-apps list never pushes the Close button
+            // off screen (same class of bug as the warning dialog).
+            final int listBodyH = (int) (activity.getResources().getDisplayMetrics().heightPixels * 0.66f);
+            scroll.setLayoutParams(new FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT, listBodyH));
 
             android.app.AlertDialog dialog = new android.app.AlertDialog.Builder(activity)
                     .setView(scroll)
@@ -2825,16 +2830,29 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
                            "I have read and understand the risks above"));
             ack.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f);
             ack.setTextColor(0xFF1A1A1A);
-            ack.setPadding(0, dp(activity, 12), 0, 0);
-            box.addView(ack);
+            ack.setPadding(dp(activity, 20), dp(activity, 12), dp(activity, 20), dp(activity, 4));
 
             ScrollView scroll = new ScrollView(activity);
             scroll.addView(box);
+            // Cap the body height so the long text can never push the bottom buttons off
+            // screen. With a large font scale the full text + checkbox measured taller than
+            // the window and the Cancel/Enable buttons were clipped ("勾选后看不到按钮").
+            final int warnBodyH = Math.min(dp(activity, 420),
+                    (int) (activity.getResources().getDisplayMetrics().heightPixels * 0.5f));
+            scroll.setLayoutParams(new FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT, warnBodyH));
+
+            // Keep the checkbox OUTSIDE the scroll area so it is always visible — scrolling
+            // the long body must never hide the acknowledgement the Enable button depends on.
+            LinearLayout root = new LinearLayout(activity);
+            root.setOrientation(LinearLayout.VERTICAL);
+            root.addView(scroll);
+            root.addView(ack);
 
             final android.app.AlertDialog dlg = new android.app.AlertDialog.Builder(activity)
                     .setTitle(tr("⚠ 高风险功能：冻结系统应用",
                                  "⚠ High-risk: freeze system apps"))
-                    .setView(scroll)
+                    .setView(root)
                     // Non-null listeners so Android never auto-disables the buttons (a null
                     // listener makes AlertController grey the button out on stock builds).
                     .setNegativeButton(tr("取消", "Cancel"),
@@ -2932,6 +2950,11 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             box.addView(tv);
             ScrollView scroll = new ScrollView(activity);
             scroll.addView(box);
+            // Same height cap as the system-freeze warning, so the buttons stay visible.
+            final int confirmBodyH = Math.min(dp(activity, 360),
+                    (int) (activity.getResources().getDisplayMetrics().heightPixels * 0.5f));
+            scroll.setLayoutParams(new FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT, confirmBodyH));
 
             new android.app.AlertDialog.Builder(activity)
                     .setTitle(tr("⚠ 即将冻结系统应用", "⚠ Freezing a system app"))
