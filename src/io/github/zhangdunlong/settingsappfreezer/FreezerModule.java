@@ -2842,63 +2842,63 @@ public class FreezerModule implements IXposedHookLoadPackage, IXposedHookZygoteI
             scroll.setLayoutParams(new FrameLayout.LayoutParams(
                     FrameLayout.LayoutParams.MATCH_PARENT, warnBodyH));
 
+            // A self-drawn confirm button that only APPEARS once the checkbox is ticked. This
+            // replaces the dialog's native positive button, whose disabled->enabled state is
+            // rendered inconsistently across OEM themes (on some ROMs ticking the box produced
+            // no tappable confirm button at all). A GONE->VISIBLE reveal is unambiguous on
+            // every ROM, and the confirm action can never be lost to an OEM button re-style.
+            final TextView confirm = new TextView(activity);
+            confirm.setText(tr("确认启用", "Confirm & enable"));
+            confirm.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f);
+            confirm.setTypeface(Typeface.DEFAULT_BOLD);
+            confirm.setGravity(Gravity.CENTER);
+            confirm.setTextColor(Color.WHITE);
+            confirm.setBackground(solidWith(ACCENT_SYSTEM));
+            int cpad = dp(activity, 16);
+            confirm.setPadding(cpad, dp(activity, 14), cpad, dp(activity, 14));
+            confirm.setVisibility(View.GONE);
+            confirm.setClickable(true);
+            confirm.setContentDescription(tr("确认启用冻结系统应用",
+                                             "Confirm enabling system-app freezing"));
+
             // Keep the checkbox OUTSIDE the scroll area so it is always visible — scrolling
             // the long body must never hide the acknowledgement the Enable button depends on.
             LinearLayout root = new LinearLayout(activity);
             root.setOrientation(LinearLayout.VERTICAL);
             root.addView(scroll);
             root.addView(ack);
+            root.addView(confirm, new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT));
 
             final android.app.AlertDialog dlg = new android.app.AlertDialog.Builder(activity)
                     .setTitle(tr("⚠ 高风险功能：冻结系统应用",
                                  "⚠ High-risk: freeze system apps"))
                     .setView(root)
-                    // Non-null listeners so Android never auto-disables the buttons (a null
-                    // listener makes AlertController grey the button out on stock builds).
-                    .setNegativeButton(tr("取消", "Cancel"),
-                            new DialogInterface.OnClickListener() {
-                                @Override
-                                public void onClick(DialogInterface d, int w) {
-                                    // default: dismiss
-                                }
-                            })
-                    // The click handler lives HERE (not via getButton in onShow) so it can never
-                    // be lost when getButton returns null due to an OEM dialog timing change.
-                    .setPositiveButton(tr("启用", "Enable"),
-                            new DialogInterface.OnClickListener() {
-                                @Override
-                                public void onClick(DialogInterface d, int w) {
-                                    if (!ack.isChecked()) {
-                                        toast(activity,
-                                                tr("请先勾选「我已阅读并了解上述风险」",
-                                                   "Please tick the acknowledgement first"),
-                                                Toast.LENGTH_SHORT);
-                                        return;   // keep the dialog open
-                                    }
-                                    setAllowSystemFreeze(activity, true);
-                                    refreshFreezeButton(activity, pkg);
-                                    toast(activity,
-                                            tr("已启用「冻结系统应用」，冻结前仍会逐次确认",
-                                               "Enabled; each system-app freeze still needs confirmation"),
-                                            Toast.LENGTH_LONG);
-                                    XposedBridge.log(TAG + ": ALLOW_SYSTEM_FREEZE=ON (risk acknowledged)");
-                                }
-                            })
+                    .setNegativeButton(tr("取消", "Cancel"), DISMISS)
                     .create();
-            // Grey the Enable button until the checkbox is ticked. If getButton is null the
-            // listener above still enforces the acknowledgement, so enabling is never ungated.
-            dlg.setOnShowListener(new DialogInterface.OnShowListener() {
+
+            // Reveal the confirm button only after the risk is acknowledged; un-ticking hides
+            // it again, so there is never an enabled path that skips the acknowledgement.
+            ack.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
                 @Override
-                public void onShow(DialogInterface d) {
-                    final Button positive = dlg.getButton(DialogInterface.BUTTON_POSITIVE);
-                    if (positive == null) return;
-                    positive.setEnabled(ack.isChecked());
-                    ack.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
-                        @Override
-                        public void onCheckedChanged(CompoundButton b, boolean checked) {
-                            positive.setEnabled(checked);
-                        }
-                    });
+                public void onCheckedChanged(CompoundButton b, boolean checked) {
+                    confirm.setVisibility(checked ? View.VISIBLE : View.GONE);
+                    confirm.setEnabled(checked);
+                }
+            });
+            confirm.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    if (!ack.isChecked()) return;
+                    setAllowSystemFreeze(activity, true);
+                    refreshFreezeButton(activity, pkg);
+                    dlg.dismiss();
+                    toast(activity,
+                            tr("已启用「冻结系统应用」，冻结前仍会逐次确认",
+                               "Enabled; each system-app freeze still needs confirmation"),
+                            Toast.LENGTH_LONG);
+                    XposedBridge.log(TAG + ": ALLOW_SYSTEM_FREEZE=ON (risk acknowledged)");
                 }
             });
             dlg.show();
